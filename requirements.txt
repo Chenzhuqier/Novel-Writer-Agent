@@ -1,4 +1,4 @@
-# 小说写作 Agent Demo 依赖
+# 小说写作 Agent Demo 依赖（v0.2 改进版）
 # ==================================
 
 # Web 框架
@@ -15,3 +15,27 @@ python-dotenv>=1.0.0
 # 开发依赖（可选）
 # pytest>=8.0.0
 # black>=24.0.0
+
+# ==================================
+# v0.2 新增依赖说明：
+#
+# 本项目核心改进不引入新的 Python 依赖包，
+# 所有改进均在代码层面实现：
+#
+# 1. Token 追踪          → 内置 TokenTracker 类
+# 2. 多模型路由          → 内置 MODEL_ROUTING 配置
+# 3. JSON 强约束         → 使用 OpenAI SDK 原生 response_format
+# 4. 版本控制            → 内置 VersionedStoryBible 类
+# 5. 上下文压缩          → 内置 ContextCompressor 逻辑
+# 6. 流式输出            → 使用 Flask Response + SSE
+# 7. 反馈重写机制        → 流水线逻辑改进
+#
+# 可选扩展（如需向量检索功能）：
+# chromadb>=0.4.0          # 向量数据库（用于语义检索）
+# sentence-transformers>=2.0  # 文本向量化（用于 RAG）
+#
+# 安装命令：
+#   pip install -r requirements.txt
+#
+# 如需完整功能（含向量检索）：
+#   pip install -r requirements.txt && pip install chromadb sentence-transformers

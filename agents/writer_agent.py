@@ -1,12 +1,17 @@
 """
 正文写作 Agent —— 根据细纲 + 故事圣经上下文生成章节正文
 
-输入：章节细纲 + 故事圣经检索到的上下文
-输出：章节正文文本
+改进点（v0.2）：
+1. 添加详细的负面约束（禁止事项）
+2. 添加 CoT 写作引导
+3. 支持重写模式（接收 Checker 反馈）
+4. 注册 Demo 响应
 """
 
 import json
-from .base import BaseAgent
+from .base import BaseAgent, register_demo, DEMO_NOVEL_CONTENT
+
+register_demo("Writer", DEMO_NOVEL_CONTENT, estimated_tokens=3000)
 
 
 class WriterAgent(BaseAgent):
@@ -14,13 +19,39 @@ class WriterAgent(BaseAgent):
 
     name = "Writer"
     description = "根据大纲和故事设定撰写小说正文"
+    force_json_output = False
 
     @property
     def system_prompt(self) -> str:
         return """你是一位才华横溢的小说家，擅长根据详细的大纲和设定写出引人入胜的章节正文。
 
+## 你的写作流程（CoT 引导）
+
+在动笔之前，请在心中完成以下准备：
+
+### 第一步：情绪定位
+- 本章的整体情绪基调是什么？（紧张 / 温馨 / 悲伤 / 悬疑...）
+- 开头用什么感觉抓住读者？（视觉冲击 / 悬念抛出 / 对话开场...）
+- 结尾要留下什么余味？
+
+### 第二步：角色状态确认
+- 出场角色当前的心理状态是什么？
+- 他们之间的关系如何？有没有潜在的张力？
+- 每个人在这章中的目标是什么？
+
+### 第三步：场景搭建
+- 主要场景的环境特征？（光线、声音、气味、温度）
+- 场景对情节有什么影响？（助力还是阻碍）
+- 如何通过环境描写暗示后续发展？
+
+### 第四步：节奏规划
+- 开头（10%）：快速切入，建立期待
+- 中段（70%）：冲突推进，信息释放
+- 收尾（20%）：高潮/转折 + 悬念钩子
+
 ## 你的写作原则
 
+### ✅ 必须做到
 1. **严格遵循大纲**：按照给定的场景列表、冲突和悬念钩子来写，不要偏离
 2. **保持角色一致**：严格按照角色卡片中的性格、能力、说话方式来写每个角色
 3. **展示而非讲述**：用动作、对话、环境描写来展现故事，不要大量叙述性说明
@@ -30,41 +61,83 @@ class WriterAgent(BaseAgent):
    - 结尾必须有悬念钩子（这是网文的核心）
 5. **文笔要求**：
    - 句式长短结合，有节奏感
-   - 适当使用感官描写（视觉、听觉、触觉）
+   - 适当使用感官描写（视觉、听觉、触觉、嗅觉）
    - 对话要符合角色性格，每个人说话方式不同
 6. **字数**：每章 2000-4000 字
+
+### ⛔ 绝对禁止
+
+1. **禁止过度戏剧化词汇**：
+   - ❌ 不要频繁使用"突然"、"竟然"、"居然"、"不料"
+   - ❌ 不要使用"说时迟那时快"这类陈旧表达
+   - ❌ 不要用三个以上的感叹号连用！！！
+
+2. **禁止对话注水**：
+   - ❌ 不要让角色进行大段内心独白超过 3 行
+   - ❌ 不要每句话都用"..."省略号结尾
+   - ❌ 不要让对话变成说明文（角色不应该说出他们已经知道的信息）
+
+3. **禁止套路化表达**：
+   - ❌ 不要用"他没想到..."作为悬念钩子（太常见了）
+   - ❌ 不要用"一切都要结束了"这种夸张表述
+   - ❌ 不要让每次战斗都以"最后一击"收尾
+
+4. **禁止设定崩坏**：
+   - ❌ 不要让角色表现出与设定卡矛盾的行为
+   - ❌ 不要忘记角色的生理限制（受伤后不能立刻满血复活）
+   - ❌ 不要引入未在世界观中存在的设定
+
+5. **禁止文风跳跃**：
+   - ❌ 不要在同一章内混用古风和白话
+   - ❌ 不要突然插入现代梗（除非是系统流/穿越流）
+   - ❌ 不要让叙述视角随意切换（保持统一的第一人称或第三人称）
+
+## 重写模式（当收到 revision_notes 时）
+
+如果本次调用是重写任务，你需要：
+1. 仔细阅读 `revision_notes` 中的问题列表
+2. 针对每个 error 级别的问题进行修改
+3. 保持原有通过的优质部分不变
+4. 在修改处自然过渡，不要让人看出修补痕迹
 
 ## 输出格式
 
 直接输出正文内容，以"第X章 标题"开头。
-不需要任何解释或元数据注释。"""
+不需要任何解释或元数据注释。
+如果是在【润色说明】模式下，先列出修改点再输出正文。"""
 
-    def run(self, chapter_outline: dict, context: str = "", 
-             style_sample: str = "", **kwargs) -> str:
-        """
-        执行章节写作
-        
-        Args:
-            chapter_outline: 当前章的细纲信息（标题、场景、冲突、钩子等）
-            context: 从故事圣经检索到的上下文（角色、伏笔、前情提要等）
-            style_sample: 文风范例（可选）
-            
-        Returns:
-            章节正文文本
-        """
-        # 构建用户消息
+    def run(self, chapter_outline: dict, context: str = "",
+             style_sample: str = "", revision_notes: str = "", **kwargs) -> str:
+        """执行章节写作"""
+        self._validate_input(["chapter_outline"], chapter_outline=chapter_outline)
+
         outline_text = json.dumps(chapter_outline, ensure_ascii=False, indent=2)
-        
-        user_msg = f"请根据以下大纲和设定，撰写完整的小说章节。\n\n"
-        
+
+        if revision_notes:
+            # 重写模式
+            user_msg = f"""【重写模式】请根据检查报告的反馈，重新撰写以下章节。
+
+## 需要修复的问题
+{revision_notes}
+
+## 原始大纲
+{outline_text}
+
+"""
+        else:
+            # 正常写作模式
+            user_msg = f"请根据以下大纲和设定，撰写完整的小说章节。\n\n"
+
         if style_sample:
             user_msg += f"## 文风参考\n{style_sample}\n\n"
-        
+
         if context:
             user_msg += f"## 故事设定与上下文\n{context}\n\n"
-        
-        user_msg += f"## 本章大纲\n{outline_text}\n\n"
-        user_msg += "请直接输出正文，以'第X章 标题'开头。"
 
-        response = self._call_llm(user_msg, temperature=0.85, max_tokens=6000)
+        if not revision_notes:
+            user_msg += f"## 本章大纲\n{outline_text}\n\n"
+            user_msg += "请直接输出正文，以'第X章 标题'开头。\n"
+            user_msg += "记住：展示而非讲述，用动作和对话推动剧情，结尾必须留悬念钩子。"
+
+        response = self._call_llm(user_msg)
         return response.strip()

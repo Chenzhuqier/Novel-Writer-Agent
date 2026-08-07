@@ -1,43 +1,293 @@
 """
 Agent 基类 —— 所有写作 Agent 的统一接口
 
-每个 Agent 的职责：
-1. 接收结构化输入（不是自由对话）
-2. 输出结构化结果（可被下游 Agent 或系统消费）
-3. 通过 system_prompt 定义角色和行为约束
+改进点（v0.2）：
+1. Token 追踪与成本统计
+2. 多模型路由策略
+3. JSON 强约束输出（response_format）
+4. 带重试的 LLM 调用
+5. Demo 模式类名注册制
+6. 流式输出支持
 """
 
 import os
+import time
+import json
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Generator, Any
+from datetime import datetime
+
+
+# ============================================================
+# Token 追踪器
+# ============================================================
+
+class TokenTracker:
+    """Token 使用追踪器 —— 记录每次 LLM 调用的 token 消耗和成本"""
+
+    # 模型定价表（每 1K tokens，单位：USD）—— 2026 年参考价格
+    PRICING = {
+        "gpt-4o": {"input": 0.0025, "output": 0.01},
+        "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+        "gpt-4-turbo": {"input": 0.01, "output": 0.03},
+        "deepseek-chat": {"input": 0.00014, "output": 0.00028},
+        "deepseek-reasoner": {"input": 0.00055, "output": 0.00219},
+        "qwen-plus": {"input": 0.0004, "output": 0.002},
+        "qwen-max": {"input": 0.0012, "output": 0.006},
+        "claude-3.5-sonnet": {"input": 0.003, "output": 0.015},
+        "default": {"input": 0.001, "output": 0.004},
+    }
+
+    def __init__(self):
+        self.usage_log: list[dict] = []
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._total_cost = 0.0
+
+    def track(self, agent_name: str, response: Any, model: str) -> dict:
+        """记录一次 LLM 调用"""
+        usage = getattr(response, 'usage', None)
+        if not usage or not hasattr(usage, 'prompt_tokens'):
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "agent": agent_name,
+                "model": model,
+                "input_tokens": -1,
+                "output_tokens": -1,
+                "cost": 0,
+                "note": "usage unavailable"
+            }
+            self.usage_log.append(entry)
+            return entry
+
+        input_tokens = usage.prompt_tokens
+        output_tokens = usage.completion_tokens
+
+        pricing = self.PRICING.get(model, self.PRICING["default"])
+        cost = (input_tokens / 1000 * pricing["input"] +
+                output_tokens / 1000 * pricing["output"])
+
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "agent": agent_name,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "cost_usd": round(cost, 6),
+        }
+
+        self.usage_log.append(entry)
+        self._total_input_tokens += input_tokens
+        self._total_output_tokens += output_tokens
+        self._total_cost += cost
+
+        return entry
+
+    @property
+    def total_calls(self) -> int:
+        return len(self.usage_log)
+
+    @property
+    def total_input_tokens(self) -> int:
+        return self._total_input_tokens
+
+    @property
+    def total_output_tokens(self) -> int:
+        return self._total_output_tokens
+
+    @property
+    def total_cost_usd(self) -> float:
+        return round(self._total_cost, 4)
+
+    def get_summary(self) -> dict:
+        """获取完整的使用统计"""
+        by_agent: dict[str, dict] = {}
+        for entry in self.usage_log:
+            agent = entry["agent"]
+            if agent not in by_agent:
+                by_agent[agent] = {
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost": 0,
+                }
+            by_agent[agent]["calls"] += 1
+            by_agent[agent]["input_tokens"] += max(entry["input_tokens"], 0)
+            by_agent[agent]["output_tokens"] += max(entry["output_tokens"], 0)
+            by_agent[agent]["cost"] += entry.get("cost_usd", 0)
+
+        return {
+            "summary": {
+                "total_calls": self.total_calls,
+                "total_input_tokens": self.total_input_tokens,
+                "total_output_tokens": self.total_output_tokens,
+                "total_cost_usd": self.total_cost_usd,
+                "estimated_cny": round(self.total_cost_usd * 7.2, 2),
+            },
+            "by_agent": by_agent,
+            "recent_calls": self.usage_log[-10:] if self.usage_log else [],
+        }
+
+    def reset(self):
+        """重置所有统计数据"""
+        self.usage_log.clear()
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._total_cost = 0.0
+
+
+# 全局 Token 追踪器实例
+tracker = TokenTracker()
+
+
+# ============================================================
+# 多模型路由配置
+# ============================================================
+
+MODEL_ROUTING = {
+    "WorldBuilder": {
+        "primary": "gpt-4o",
+        "fallback": "deepseek-reasoner",
+        "temperature": 0.9,
+        "max_tokens": 4096,
+        "reasoning": True,
+    },
+    "OutlineArchitect": {
+        "primary": "gpt-4o",
+        "fallback": "claude-3.5-sonnet",
+        "temperature": 0.8,
+        "max_tokens": 6000,
+        "reasoning": False,
+    },
+    "Writer": {
+        "primary": "gpt-4o-mini",
+        "fallback": "deepseek-chat",
+        "temperature": 0.85,
+        "max_tokens": 6000,
+        "reasoning": False,
+    },
+    "PlotChecker": {
+        "primary": "gpt-4o-mini",
+        "fallback": "qwen-plus",
+        "temperature": 0.3,
+        "max_tokens": 3000,
+        "reasoning": False,
+    },
+    "Polisher": {
+        "primary": "gpt-4o-mini",
+        "fallback": "deepseek-chat",
+        "temperature": 0.6,
+        "max_tokens": 6000,
+        "reasoning": False,
+    },
+}
+
+
+def get_model_config(agent_name: str) -> dict:
+    """获取指定 Agent 的模型配置"""
+    default_config = {
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "reasoning": False,
+    }
+    return MODEL_ROUTING.get(agent_name, default_config)
 
 
 # ============================================================
 # LLM 调用封装
 # ============================================================
 
-def call_llm(system_prompt: str, user_message: str, 
-             model: str = None, temperature: float = 0.8,
-             max_tokens: int = 4096) -> str:
+def call_llm(
+    system_prompt: str,
+    user_message: str,
+    model: str = None,
+    temperature: float = 0.8,
+    max_tokens: int = 4096,
+    force_json: bool = False,
+    agent_name: str = "Unknown",
+) -> str:
     """
     统一的 LLM 调用接口
-    
-    支持两种模式：
-    - 有 API Key 时：调用 OpenAI 兼容接口（支持 GPT / DeepSeek / 通义千问 等）
-    - 无 API Key 时：使用本地模拟输出（Demo 模式）
+
+    改进点：
+    - 支持 OpenAI Structured Outputs（force_json）
+    - 自动 fallback 到备用模型
+    - 带指数退避的重试机制
+    - 自动记录 Token 使用量
     """
     api_key = os.environ.get("OPENAI_API_KEY", "")
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
     model = model or os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
     if not api_key:
-        # Demo 模式：返回模拟输出
-        return _demo_fallback(system_prompt, user_message)
+        return _demo_fallback(system_prompt, user_message, agent_name)
+
+    max_retries = 2
+    config = get_model_config(agent_name)
+    models_to_try = [model or config["primary"], config["fallback"]]
+
+    for attempt in range(max_retries + 1):
+        try:
+            import openai
+
+            current_model = models_to_try[min(attempt, len(models_to_try) - 1)]
+            client = openai.OpenAI(api_key=api_key, base_url=base_url)
+
+            kwargs = {
+                "model": current_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+
+            if force_json:
+                kwargs["response_format"] = {"type": "json_object"}
+
+            response = client.chat.completions.create(**kwargs)
+            tracker.track(agent_name, response, current_model)
+
+            content = response.choices[0].message.content or ""
+            return content
+
+        except Exception as e:
+            print(f"[LLM 调用失败] 尝试 {attempt + 1}/{max_retries + 1}: {e}")
+            if attempt < max_retries:
+                wait_time = 2 ** attempt
+                print(f"  → 等待 {wait_time}s 后重试...")
+                time.sleep(wait_time)
+            else:
+                print(f"  → 所有尝试均失败，回退到 Demo 模式")
+                return _demo_fallback(system_prompt, user_message, agent_name)
+
+
+def stream_llm(
+    system_prompt: str,
+    user_message: str,
+    model: str = None,
+    temperature: float = 0.8,
+    max_tokens: int = 4096,
+    agent_name: str = "Unknown",
+) -> Generator[str, None, None]:
+    """流式 LLM 调用接口 —— Yields 文本片段"""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    model = model or os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+    if not api_key:
+        yield _demo_fallback(system_prompt, user_message, agent_name)
+        return
 
     try:
         import openai
+
         client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -45,23 +295,57 @@ def call_llm(system_prompt: str, user_message: str,
             ],
             temperature=temperature,
             max_tokens=max_tokens,
+            stream=True,
         )
-        return response.choices[0].message.content or ""
+
+        full_content = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                full_content += delta
+                yield delta
+
+        class FakeResponse:
+            class FakeUsage:
+                prompt_tokens = 0
+                completion_tokens = len(full_content) // 3
+                total_tokens = 0
+            usage = FakeUsage()
+
+        tracker.track(agent_name, FakeResponse(), model)
+
     except Exception as e:
-        print(f"[LLM 调用失败] {e}")
-        return _demo_fallback(system_prompt, user_message)
+        print(f"[流式 LLM 调用失败] {e}")
+        yield _demo_fallback(system_prompt, user_message, agent_name)
 
 
-def _demo_fallback(system_prompt: str, user_message: str) -> str:
-    """
-    Demo 回退模式 —— 当没有配置 API Key 时使用
-    
-    返回一个示例输出，让用户可以在不配 API 的情况下体验完整流程。
-    实际项目中应替换为真实 LLM 调用。
-    """
-    # 根据不同的 system_prompt 关键词，返回对应的示例输出
+# ============================================================
+# Demo 配置与回退
+# ============================================================
+
+class DemoConfig:
+    """Demo 模式配置"""
+    def __init__(self, agent_class_name: str, demo_response: str, estimated_tokens: int = 1500):
+        self.agent_class_name = agent_class_name
+        self.demo_response = demo_response
+        self.estimated_tokens = estimated_tokens
+
+
+DEMO_REGISTRY: dict[str, DemoConfig] = {}
+
+
+def register_demo(agent_class_name: str, demo_response: str, estimated_tokens: int = 1500):
+    """注册 Demo 响应"""
+    DEMO_REGISTRY[agent_class_name] = DemoConfig(agent_class_name, demo_response, estimated_tokens)
+
+
+def _demo_fallback(system_prompt: str, user_message: str, agent_name: str = "Unknown") -> str:
+    """Demo 回退模式 —— 优先按类名查找"""
+    if agent_name in DEMO_REGISTRY:
+        return DEMO_REGISTRY[agent_name].demo_response
+
+    # 向后兼容的关键词匹配
     sp_lower = system_prompt.lower()
-    
     if "世界构建" in system_prompt or "world" in sp_lower:
         return DEMO_WORLD_BUILDING
     elif "大纲" in system_prompt and "章节" in system_prompt:
@@ -79,7 +363,7 @@ def _demo_fallback(system_prompt: str, user_message: str) -> str:
 
 
 # ============================================================
-# Demo 示例输出（用于无 API Key 时的演示）
+# Demo 数据
 # ============================================================
 
 DEMO_WORLD_BUILDING = """{
@@ -97,30 +381,21 @@ DEMO_WORLD_BUILDING = """{
   ],
   "characters": [
     {
-      "name": "沈炼",
-      "alias": ["寒江剑客"],
-      "age": 24,
-      "gender": "男",
+      "name": "沈炼", "alias": ["寒江剑客"], "age": 24, "gender": "男",
       "appearance": "身形清瘦，左眉有一道细长疤痕，常穿青灰色布衣，腰间佩一柄古朴长剑「寒江」",
       "personality": ["隐忍", "重诺", "外冷内热"],
       "abilities": {"剑术": "宗师级", "内功": "少阳诀第三重", "特殊能力": "能感知他人杀意"},
       "arc": "从复仇驱动的孤行者 → 学会信任与放下 → 守护所爱之人"
     },
     {
-      "name": "苏清歌",
-      "alias": ["药王谷小师妹"],
-      "age": 19,
-      "gender": "女",
+      "name": "苏清歌", "alias": ["药王谷小师妹"], "age": 19, "gender": "女",
       "appearance": "肤白如雪，眉心有一点朱砂痣，气质清冷如月下梨花",
       "personality": ["聪慧", "倔强", "心地善良"],
       "abilities": {"医术": "精通", "毒术": "略通", "轻功": "上乘"},
       "arc": "从被保护的温室花朵 → 独当一面 → 成为沈炼的精神支柱"
     },
     {
-      "name": "厉千行",
-      "alias": ["血月教主"],
-      "age": 200,
-      "gender": "男",
+      "name": "厉千行", "alias": ["血月教主"], "age": 200, "gender": "男",
       "appearance": "面容俊美妖异，一双眸子呈暗红色，周身常年萦绕淡淡血雾",
       "personality": ["偏执", "深情", "不择手段"],
       "abilities": {"魔功": "血月天经大成", "特殊能力": "可操控死者尸傀"},
@@ -133,19 +408,15 @@ DEMO_WORLD_BUILDING = """{
 }"""
 
 DEMO_CHAPTER_OUTLINE = """{
-  "volumes": [
-    {
-      "volume_num": 1,
-      "volume_title": "孤剑出山",
-      "chapter_count": 10,
-      "arc_summary": "沈炼离开隐居十年的山门，踏入江湖寻找灭门真相。初遇苏清歌，卷入天剑宗与血月教的冲突。",
-      "chapters": [
-        {"num": 1, "title": "寒江剑鸣", "scenes": ["沈炼在山中练剑", "收到神秘信件暗示灭门线索", "决定下山"], "conflict": "内心挣扎：十年隐居 vs 复仇使命", "hook": "信件末尾署名竟是他已故父亲的名字"},
-        {"num": 2, "title": "落星城遇雨", "scenes": ["抵达落星城", "偶遇苏清歌被人追杀", "出手相救"], "conflict": "沈炼不想惹麻烦但无法袖手旁观", "hook": "追杀苏清歌的人认出了沈炼的剑法"},
-        {"num": 3, "title": "药王谷来客", "scenes": ["苏清歌身份揭晓", "得知她身上有重要秘密", "血月教暗杀者出现"], "conflict": "是否应该卷入更大的漩涡", "hook": "暗杀者临死前说出一句话：'你也姓沈……'"}
-      ]
-    }
-  ]
+  "volumes": [{
+    "volume_num": 1, "volume_title": "孤剑出山", "chapter_count": 10,
+    "arc_summary": "沈炼离开隐居十年的山门，踏入江湖寻找灭门真相。初遇苏清歌，卷入天剑宗与血月教的冲突。",
+    "chapters": [
+      {"num": 1, "title": "寒江剑鸣", "scenes": ["沈炼在山中练剑", "收到神秘信件暗示灭门线索", "决定下山"], "conflict": "内心挣扎：十年隐居 vs 复仇使命", "hook": "信件末尾署名竟是他已故父亲的名字", "characters": ["沈炼"], "notes": ""},
+      {"num": 2, "title": "落星城遇雨", "scenes": ["抵达落星城", "偶遇苏清歌被人追杀", "出手相救"], "conflict": "沈炼不想惹麻烦但无法袖手旁观", "hook": "追杀苏清歌的人认出了沈炼的剑法", "characters": ["沈炼", "苏清歌"], "notes": ""},
+      {"num": 3, "title": "药王谷来客", "scenes": ["苏清歌身份揭晓", "得知她身上有重要秘密", "血月教暗杀者出现"], "conflict": "是否应该卷入更大的漩涡", "hook": "暗杀者临死前说出一句话：'你也姓沈……'", "characters": ["沈炼", "苏清歌"], "notes": ""}
+    ]
+  }]
 }"""
 
 DEMO_NOVEL_CONTENT = '''第一章 寒江剑鸣
@@ -220,22 +491,15 @@ DEMO_CHECK_RESULT = """{
   "passed": true,
   "issues": [],
   "warnings": [
-    {
-      "type": "consistency_check",
-      "severity": "info",
-      "detail": "第一章中沈炼的年龄设定为24岁，与故事圣经一致（12岁上山+10年=22岁，建议确认或调整为24岁以匹配）",
-      "suggestion": "建议在世界构建阶段明确沈炼上山时的确切年龄"
-    },
-    {
-      "type": "foreshadowing",
-      "severity": "info",
-      "detail": "本章埋设了3条伏笔：①信件署名之谜 ②寒江剑的特殊性 ③沈炼被注视的感觉（可能暗示某种能力觉醒）",
-      "suggestion": "伏笔记录已自动更新到故事圣经"
-    }
+    {"type": "consistency_check", "severity": "info", "detail": "第一章中沈炼的年龄设定为24岁，与故事圣经一致", "suggestion": "建议在世界构建阶段明确沈炼上山时的确切年龄"},
+    {"type": "foreshadowing", "severity": "info", "detail": "本章埋设了3条伏笔：①信件署名之谜 ②寒江剑的特殊性 ③沈炼被注视的感觉", "suggestion": "伏笔记录已自动更新到故事圣经"}
   ],
   "character_status_ok": true,
   "timeline_consistent": true,
-  "overall_quality_score": 8.5
+  "foreshadowing_notes": ["本章新埋设的伏笔：信件署名之谜、寒江剑秘密、感知能力觉醒"],
+  "overall_quality_score": 8.5,
+  "scores_by_dimension": {"角色一致性": 9.0, "设定合规性": 8.5, "情节逻辑": 8.5, "节奏把控": 8.0, "文笔质量": 8.5},
+  "summary": "第一章整体质量良好，角色塑造生动，悬念设置到位。建议后续章节注意年龄设定的细节一致性。"
 }"""
 
 DEMO_POLISHED_CONTENT = '''第一章 寒江剑鸣
@@ -304,7 +568,7 @@ DEMO_POLISHED_CONTENT = '''第一章 寒江剑鸣
 
 除非写信之人，持有那封绝笔本身。
 
-山风拂过，将信纸一角轻轻掀起。沈炼伫立良久，一动不动。晨光落在他左眉的疤痕上，使那道陈年旧痕看上去宛如一道干涸的河床。
+山风拂过，将信纸一角轻轻掀起。沈炼伫立良久，一动不动。晨光落在他左眉的疤痕上，使那道陈年旧痕宛如一道干涸的河床。
 
 半晌，他将信折好，纳入怀中。
 
@@ -329,14 +593,26 @@ DEMO_SUMMARY = """{
 # ============================================================
 
 class BaseAgent(ABC):
-    """所有 Agent 的抽象基类"""
+    """
+    所有 Agent 的抽象基类
+
+    改进点（v0.2）：
+    - 强制抽象方法约束
+    - 内置输入校验
+    - 自动多模型路由
+    - 带 JSON 强约束的 LLM 调用
+    - 重试机制封装
+    """
 
     name: str = "BaseAgent"
     description: str = ""
+    force_json_output: bool = True
 
-    def __init__(self, model: str = None, temperature: float = 0.8):
-        self.model = model
-        self.temperature = temperature
+    def __init__(self, model: str = None, temperature: float = None):
+        config = get_model_config(self.name)
+        self.model = model or config["primary"]
+        self.temperature = temperature if temperature is not None else config["temperature"]
+        self.max_tokens = config["max_tokens"]
 
     @property
     @abstractmethod
@@ -345,19 +621,63 @@ class BaseAgent(ABC):
         ...
 
     @abstractmethod
-    def run(self, **kwargs) -> dict:
+    def run(self, **kwargs):
         """执行 Agent 逻辑，返回结构化结果"""
         ...
 
-    def _call_llm(self, user_message: str, temperature: float = None, 
-                  max_tokens: int = 4096) -> str:
+    def _validate_input(self, required_keys: list[str], **kwargs):
+        """通用的输入校验"""
+        missing = [k for k in required_keys if k not in kwargs or not kwargs[k]]
+        if missing:
+            raise ValueError(f"[{self.name}] 缺少必要参数: {', '.join(missing)}")
+
+    def _call_llm(self, user_message: str, temperature: float = None,
+                  max_tokens: int = None, force_json: bool = None) -> str:
+        """带完整功能的 LLM 调用"""
         return call_llm(
             system_prompt=self.system_prompt,
             user_message=user_message,
             model=self.model,
             temperature=temperature or self.temperature,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens or self.max_tokens,
+            force_json=force_json if force_json is not None else self.force_json_output,
+            agent_name=self.name,
         )
 
+    def _call_llm_stream(self, user_message: str, temperature: float = None,
+                         max_tokens: int = None):
+        """流式 LLM 调用"""
+        return stream_llm(
+            system_prompt=self.system_prompt,
+            user_message=user_message,
+            model=self.model,
+            temperature=temperature or self.temperature,
+            max_tokens=max_tokens or self.max_tokens,
+            agent_name=self.name,
+        )
+
+    def _parse_json_response(self, response: str) -> dict | str:
+        """安全解析 JSON 响应"""
+        try:
+            clean = response.strip()
+            if clean.startswith("```"):
+                lines = clean.split("\n")
+                start_idx = 0
+                end_idx = len(lines)
+                for i, line in enumerate(lines):
+                    if line.startswith("```") and start_idx == 0:
+                        start_idx = i + 1
+                        continue
+                    if line.startswith("```") and i > start_idx:
+                        end_idx = i
+                        break
+                clean = "\n".join(lines[start_idx:end_idx])
+            result = json.loads(clean)
+            return result
+        except json.JSONDecodeError as e:
+            print(f"[{self.name}] JSON 解析失败: {e}")
+            print(f"  原始响应前200字符: {response[:200]}...")
+            return {"raw_output": response, "parse_error": True, "error_msg": str(e)}
+
     def __repr__(self):
-        return f"<{self.name}>"
+        return f"<{self.name} | model={self.model} | temp={self.temperature}>"

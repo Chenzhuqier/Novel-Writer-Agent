@@ -1,7 +1,4 @@
-# Core Package
-from .story_bible import StoryBible, Character, Location, Item, Foreshadowing, TimelineEvent, ChapterSummary
+"""核心数据层"""
+from .story_bible import StoryBible, ChapterSummary, VersionedStoryBible
 
-__all__ = [
-    "StoryBible", "Character", "Location", "Item",
-    "Foreshadowing", "TimelineEvent", "ChapterSummary",
-]
+__all__ = ["StoryBible", "ChapterSummary", "VersionedStoryBible"]

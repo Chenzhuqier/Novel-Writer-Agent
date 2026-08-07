@@ -3,178 +3,194 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>📖 小说写作 Agent</title>
-    <link rel="stylesheet" href="/static/css/style.css">
+    <title>📖 小说写作 Agent v0.2</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
-    <div class="app-container">
-        <!-- 侧边栏 -->
-        <aside class="sidebar">
-            <div class="logo">
-                <span class="logo-icon">📖</span>
-                <h1>小说写作 Agent</h1>
-                <p class="version">Demo v0.1</p>
+    <div class="container">
+        <!-- 标题栏 -->
+        <header class="app-header">
+            <h1>📖 小说写作 Agent <span class="version">v0.2</span></h1>
+            <p class="subtitle">AI 驱动的长篇小说创作工作台 | 改进版（含反馈回路+Token追踪+版本控制）</p>
+        </header>
+
+        <!-- 主布局 -->
+        <div class="main-layout">
+            <!-- 左侧：输入与控制 -->
+            <div class="left-panel">
+                <!-- 步骤1：创意输入 -->
+                <section class="card step-card" id="step-input">
+                    <h2>📝 第一步：输入创意</h2>
+                    <div class="form-group">
+                        <label>小说类型</label>
+                        <select id="genre">
+                            <option value="">自动检测</option>
+                            <option value="玄幻/修仙">玄幻 / 修仙</option>
+                            <option value="都市">都市</option>
+                            <option value="科幻">科幻</option>
+                            <option value="悬疑">悬疑 / 推理</option>
+                            <option value="历史">历史</option>
+                            <option value="言情">言情</option>
+                            <option value="游戏">游戏 / 系统</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>核心创意描述</label>
+                        <textarea id="premise" rows="4" placeholder="例如：一个现代都市里隐藏着修仙者的世界，主角是一个送外卖的普通人意外获得传承..."></textarea>
+                    </div>
+                    <button id="btn-start" onclick="startProject()">🚀 初始化项目</button>
+                </section>
+
+                <!-- 步骤2：世界构建 -->
+                <section class="card step-card" id="step-world">
+                    <h2>🌍 第二步：构建世界</h2>
+                    <p class="hint">AI 将根据你的创意生成完整的世界观、角色、势力等设定。</p>
+                    <button id="btn-build-world" onclick="buildWorld()" disabled>⚡ 构建世界观</button>
+                    <button id="btn-confirm-world" onclick="confirmStep('world')" style="display:none;" class="btn-confirm">✅ 确认世界观</button>
+                </section>
+
+                <!-- 步骤3：大纲 -->
+                <section class="card step-card" id="step-outline">
+                    <h2>📋 第三步：生成大纲</h2>
+                    <div class="form-group">
+                        <label>章节数量</label>
+                        <input type="number" id="chapter-count" value="10" min="3" max="100">
+                    </div>
+                    <button id="btn-outline" onclick="generateOutline()" disabled>📐 生成大纲</button>
+                    <button id="btn-confirm-outline" onclick="confirmStep('outline')" style="display:none;" class="btn-confirm">✅ 确认大纲</button>
+                </section>
+
+                <!-- 步骤4：写作 -->
+                <section class="card step-card" id="step-write">
+                    <h2>✍️ 第四步：开始写作</h2>
+                    <div class="write-controls">
+                        <button id="btn-write-all" onclick="writeAll()" disabled>📝 写作全部章节</button>
+                        <span class="divider">或</span>
+                        <input type="number" id="single-chapter" value="1" min="1" style="width:60px;">
+                        <button id="btn-write-chapter" onclick="writeChapter()" disabled>写单章</button>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="use-streaming" checked>
+                            流式输出
+                        </label>
+                    </div>
+                </section>
+
+                <!-- 操作按钮组 -->
+                <section class="card action-card">
+                    <h2>🛠️ 操作</h2>
+                    <div class="action-buttons">
+                        <button onclick="exportNovel()" id="btn-export" disabled>📥 导出 TXT</button>
+                        <button onclick="resetProject()" class="btn-danger">🔄 重置项目</button>
+                        <button onclick="showCostPanel()" class="btn-info">💰 成本统计</button>
+                        <button onclick="showVersionPanel()" class="btn-info">📦 版本历史</button>
+                    </div>
+                </section>
             </div>
 
-            <!-- 步骤导航 -->
-            <nav class="step-nav">
-                <div class="step-item" data-step="input" id="step-input">
-                    <span class="step-num">1</span>
-                    <span class="step-label">创意输入</span>
-                </div>
-                <div class="step-item" data-step="world_building" id="step-world">
-                    <span class="step-num">2</span>
-                    <span class="step-label">世界构建</span>
-                </div>
-                <div class="step-item" data-step="outline" id="step-outline">
-                    <span class="step-num">3</span>
-                    <span class="step-label">大纲生成</span>
-                </div>
-                <div class="step-item" data-step="writing" id="step-writing">
-                    <span class="step-num">4</span>
-                    <span class="step-label">正文写作</span>
-                </div>
-                <div class="step-item" data-step="done" id="step-done">
-                    <span class="step-num">✓</span>
-                    <span class="step-label">完成</span>
-                </div>
-            </nav>
-
-            <!-- 状态面板 -->
-            <div class="status-panel">
-                <h3>📊 项目状态</h3>
-                <div id="status-info">
-                    <div class="status-row"><span>当前阶段：</span><span id="cur-step">准备就绪</span></div>
-                    <div class="status-row"><span>书名：</span><span id="bible-title">-</span></div>
-                    <div class="status-row"><span>类型：</span><span id="genre">-</span></div>
-                    <div class="status-row"><span>角色数：</span><span id="char-count">0</span></div>
-                    <div class="status-row"><span>已写章节：</span><span id="written-count">0/0</span></div>
-                </div>
-                <div id="status-message" class="status-msg">等待输入创意...</div>
-
-                <!-- 进度条 -->
-                <div class="progress-bar" id="progress-wrap" style="display:none;">
-                    <div class="progress-fill" id="progress-fill"></div>
-                </div>
-            </div>
-
-            <!-- 操作按钮组 -->
-            <div class="actions">
-                <button class="btn btn-primary" id="btn-start" onclick="handleStart()">▶ 开始新项目</button>
-                <button class="btn btn-accent" id="btn-build-world" onclick="handleBuildWorld()" disabled>🌍 构建世界</button>
-                <button class="btn btn-accent" id="btn-outline" onclick="handleOutline()" disabled>📋 生成大纲</button>
-                <button class="btn btn-success" id="btn-write-all" onclick="handleWriteAll()" disabled>✍️ 写作全部</button>
-                <button class="btn btn-secondary" id="btn-export" onclick="handleExport()" disabled>📥 导出</button>
-                <button class="btn btn-danger" id="btn-reset" onclick="handleReset()">🔄 重置</button>
-            </div>
-        </aside>
-
-        <!-- 主内容区 -->
-        <main class="main-content">
-            <!-- Tab 切换 -->
-            <div class="tab-bar">
-                <button class="tab-btn active" data-tab="workspace" onclick="switchTab('workspace')">📝 工作台</button>
-                <button class="tab-btn" data-tab="bible" onclick="switchTab('bible')">📚 故事圣经</button>
-                <button class="tab-btn" data-tab="outline-view" onclick="switchTab('outline-view')">📋 大纲</button>
-                <button class="tab-btn" data-tab="chapters" onclick="switchTab('chapters')">📄 章节</button>
-                <button class="tab-btn" data-tab="logs" onclick="switchTab('logs')">📜 日志</button>
-            </div>
-
-            <!-- Tab 内容区 -->
-            <div class="tab-content">
-                <!-- 工作台 Tab -->
-                <div class="tab-pane active" id="tab-workspace">
-                    <div class="panel input-panel">
-                        <h2>✨ 输入你的创意</h2>
-                        <div class="form-group">
-                            <label>小说类型（可选）</label>
-                            <select id="input-genre">
-                                <option value="">自动选择</option>
-                                <option value="玄幻/修仙">玄幻 / 修仙</option>
-                                <option value="都市">都市</option>
-                                <option value="科幻">科幻</option>
-                                <option value="悬疑/推理">悬疑 / 推理</option>
-                                <option value="历史/架空">历史 / 架空</option>
-                                <option value="言情/爱情">言情 / 爱情</option>
-                                <option value="武侠">武侠</option>
-                                <option value="恐怖/惊悚">恐怖 / 惊悚</option>
-                            </select>
+            <!-- 右侧：输出展示 -->
+            <div class="right-panel">
+                <!-- 状态面板 -->
+                <section class="card status-card">
+                    <h2>📊 运行状态</h2>
+                    <div id="status-display">
+                        <div class="status-item">
+                            <span class="label">当前步骤：</span>
+                            <span id="current-step" class="value">等待初始化</span>
                         </div>
-                        <div class="form-group">
-                            <label>核心创意描述</label>
-                            <textarea id="input-premise" rows="6" placeholder="描述你的故事创意...&#10;&#10;例如：一个被灭门的少年，在深山隐居十年后，收到一封来自亡父的信件，决定下山追寻真相..."></textarea>
+                        <div class="status-item">
+                            <span class="label">状态消息：</span>
+                            <span id="status-message" class="value">准备就绪</span>
                         </div>
-                        <div class="form-group">
-                            <label>章节数量（大纲用）</label>
-                            <input type="number" id="input-chapters" value="10" min="1" max="100">
+                        <div class="status-item">
+                            <span class="label">进度：</span>
+                            <span id="progress" class="value">-</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="label">Story Bible 版本：</span>
+                            <span id="bible-version" class="value">v0</span>
                         </div>
                     </div>
-
-                    <!-- 实时日志流 -->
-                    <div class="panel log-panel">
-                        <h2>📜 运行日志</h2>
-                        <div id="log-stream" class="log-stream">
-                            <div class="log-entry info">[系统] 小说写作 Agent 已就绪，请输入创意并开始。</div>
-                        </div>
+                    <div class="progress-bar-container" id="progress-container" style="display:none;">
+                        <div class="progress-bar" id="progress-bar"></div>
                     </div>
-                </div>
+                </section>
 
-                <!-- 故事圣经 Tab -->
-                <div class="tab-pane" id="tab-bible">
-                    <div class="panel bible-panel">
-                        <h2>📚 故事圣经</h2>
-                        <pre id="bible-content" class="code-block">暂无数据，请先完成世界构建...</pre>
+                <!-- 日志面板 -->
+                <section class="card log-card">
+                    <h2>📜 日志</h2>
+                    <div id="log-container" class="log-container"></div>
+                </section>
+
+                <!-- 内容展示区 -->
+                <section class="card content-card">
+                    <div class="content-tabs">
+                        <button class="tab-btn active" data-tab="world-tab" onclick="switchTab('world')">🌍 世界观</button>
+                        <button class="tab-btn" data-tab="outline-tab" onclick="switchTab('outline')">📋 大纲</button>
+                        <button class="tab-btn" data-tab="chapter-tab" onclick="switchTab('chapter')">📖 章节</button>
+                        <button class="tab-btn" data-tab="bible-tab" onclick="switchTab('bible')">📚 圣经</button>
                     </div>
-                </div>
-
-                <!-- 大纲 Tab -->
-                <div class="tab-pane" id="tab-outline-view">
-                    <div class="panel outline-panel">
-                        <h2>📋 大纲结构</h2>
-                        <pre id="outline-content" class="code-block">暂无数据，请先生成大纲...</pre>
+                    <div id="world-tab" class="tab-content active">
+                        <pre id="world-output"></pre>
                     </div>
-                </div>
-
-                <!-- 章节 Tab -->
-                <div class="tab-pane" id="tab-chapters">
-                    <div class="panel chapters-panel">
-                        <h2>📄 章节内容</h2>
-                        <div class="chapter-selector">
-                            <select id="chapter-select" onchange="loadChapter()">
+                    <div id="outline-tab" class="tab-content">
+                        <pre id="outline-output"></pre>
+                    </div>
+                    <div id="chapter-tab" class="tab-content">
+                        <div class="chapter-nav">
+                            <select id="chapter-select" onchange="loadChapter(this.value)">
                                 <option value="">选择章节...</option>
                             </select>
-                            <span class="view-toggle">
-                                <button class="btn-sm active" id="view-draft" onclick="setViewMode('draft')">初稿</button>
-                                <button class="btn-sm" id="view-polished" onclick="setViewMode('polished')">润色版</button>
-                            </span>
+                            <span id="chapter-meta"></span>
                         </div>
-                        <div id="chapter-content" class="chapter-text">
-                            选择一个章节查看内容...
+                        <div class="chapter-view-toggle">
+                            <button class="toggle-btn active" onclick="toggleChapterView('draft')">初稿</button>
+                            <button class="toggle-btn" onclick="toggleChapterView('polished')">润色稿</button>
+                            <button class="toggle-btn" onclick="toggleChapterView('check')">检查报告</button>
                         </div>
-                        <div id="chapter-check" class="check-report" style="display:none;">
-                            <h3>🔍 检查报告</h3>
-                            <pre id="check-report-content"></pre>
-                        </div>
+                        <pre id="chapter-output"></pre>
                     </div>
-                </div>
-
-                <!-- 日志 Tab -->
-                <div class="tab-pane" id="tab-logs">
-                    <div class="panel logs-panel">
-                        <h2>📜 完整操作日志</h2>
-                        <div id="full-logs" class="log-stream"></div>
+                    <div id="bible-tab" class="tab-content">
+                        <pre id="bible-output"></pre>
                     </div>
-                </div>
+                </section>
             </div>
-        </main>
+        </div>
     </div>
 
-    <!-- 加载遮罩 -->
-    <div class="loading-overlay" id="loading" style="display:none;">
-        <div class="spinner"></div>
-        <p id="loading-text">处理中...</p>
+    <!-- 成本统计弹窗 -->
+    <div id="cost-modal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>💰 Token 使用统计</h3>
+                <button onclick="closeModal('cost-modal')" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body" id="cost-body">
+                <p>加载中...</p>
+            </div>
+            <div class="modal-footer">
+                <button onclick="resetCostStats()" class="btn-warning">重置统计</button>
+                <button onclick="closeModal('cost-modal')" class="btn-primary">关闭</button>
+            </div>
+        </div>
     </div>
 
-    <script src="/static/js/app.js"></script>
+    <!-- 版本历史弹窗 -->
+    <div id="version-modal" class="modal" style="display:none;">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3>📦 Story Bible 版本历史</h3>
+                <button onclick="closeModal('version-modal')" class="close-btn">&times;</button>
+            </div>
+            <div class="modal-body" id="version-body">
+                <p>加载中...</p>
+            </div>
+            <div class="modal-footer">
+                <button onclick="createCheckpoint()" class="btn-primary">创建快照</button>
+                <button onclick="closeModal('version-modal')" class="btn-primary">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

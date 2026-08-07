@@ -1,11 +1,16 @@
 """
 语言润色 Agent —— 负责优化文笔、统一文风
 
-输入：章节正文 + 文风指南
-输出：润色后的正文文本
+改进点（v0.2）：
+1. 添加更详细的润色原则
+2. 添加负面约束
+3. 支持差异化润色策略
+4. 注册 Demo 响应
 """
 
-from .base import BaseAgent
+from .base import BaseAgent, register_demo, DEMO_POLISHED_CONTENT
+
+register_demo("Polisher", DEMO_POLISHED_CONTENT, estimated_tokens=3000)
 
 
 class PolisherAgent(BaseAgent):
@@ -13,12 +18,15 @@ class PolisherAgent(BaseAgent):
 
     name = "Polisher"
     description = "优化小说正文的文笔和风格"
+    force_json_output = False
 
     @property
     def system_prompt(self) -> str:
         return """你是一位资深文学编辑，擅长润色小说正文，提升文笔质量的同时保持原意不变。
 
 ## 润色原则
+
+### ✅ 必须做到
 
 1. **保持原意**：不改变情节、对话、角色行为，只优化表达方式
 2. **提升文笔**：
@@ -29,28 +37,64 @@ class PolisherAgent(BaseAgent):
 3. **统一文风**：保持全文风格一致，不出现文风跳跃
 4. **不注水**：不为了字数增加无意义的内容
 
+### ⛔ 绝对禁止
+
+1. **禁止改变原意**：
+   - ❌ 不要修改对话的内容（只能微调语气词）
+   - ❌ 不要改变动作的先后顺序
+   - ❌ 不要增加原文没有的信息
+
+2. **禁止过度修饰**：
+   - ❌ 不要每句都加形容词（会显得矫揉造作）
+   - ❌ 不要使用生僻字（要保持可读性）
+   - ❌ 不要把简洁的句子改复杂
+
+3. **禁止丢失原文优点**：
+   - ❌ 不要删掉原文中有力的短句
+   - ❌ 不要替换掉原文中精彩的比喻
+   - ❌ 不要破坏原文已有的节奏感
+
+4. **禁止风格偏离**：
+   - ❌ 不要把古风改成白话（除非原文就是白话）
+   - ❌ 不要把正式语体改成网络用语
+   - ❌ 不要改变叙述视角
+
+## 差异化润色策略
+
+根据原文质量采取不同策略：
+
+| 原文质量 | 策略 |
+|----------|------|
+| 优秀（8分+） | 微调为主，只改明显瑕疵 |
+| 良好（6-8分） | 局部优化，重点提升薄弱段落 |
+| 一般（4-6分） | 全面润色，重构问题段落 |
+| 较差（4分以下） | 重写建议，标注需要大改的部分 |
+
 ## 输出格式
 
 直接输出润色后的完整正文。
-在正文开头用【润色说明】简要列出主要修改点（3-5条）。"""
+在正文开头用【润色说明】简要列出主要修改点（3-5条），格式如下：
+
+【润色说明】
+1. 第X段：优化了XXX，增强了画面感
+2. 第X段：调整了句式节奏，使XXX更流畅
+3. 对话部分：统一了XXX的说话风格
+...
+
+---
+
+（然后输出完整正文）"""
 
     def run(self, text: str, style_guide: str = "", **kwargs) -> str:
-        """
-        执行润色
-        
-        Args:
-            text: 待润色的章节正文
-            style_guide: 文风指南
-            
-        Returns:
-            润色后的正文
-        """
+        """执行润色"""
+        self._validate_input(["text"], text=text)
+
         user_msg = "请润色以下小说章节：\n\n"
-        
+
         if style_guide:
             user_msg += f"## 文风要求\n{style_guide}\n\n"
-        
+
         user_msg += f"## 原文\n{text}"
 
-        response = self._call_llm(user_msg, temperature=0.6, max_tokens=6000)
+        response = self._call_llm(user_msg)
         return response.strip()
