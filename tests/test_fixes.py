@@ -139,6 +139,55 @@ class TestFix1_StoryBibleBaseClass:
             assert len(restored.characters) == 1
             print("✅ 序列化/反序列化正常")
 
+    def test_version_history_persisted(self):
+        """版本历史应该随序列化落盘并可恢复"""
+        from core.story_bible import VersionedStoryBible
+        bible = VersionedStoryBible(title="版本持久化测试", genre="玄幻")
+
+        # 创建若干版本快照
+        bible.add_character(name="初版角色", gender="男")
+        bible.checkpoint("添加初版角色")
+        bible.add_foreshadowing(content="第一处伏笔", planted_in="第1章")
+        bible.checkpoint("添加第一处伏笔")
+        assert bible.version_count == 3
+        assert bible.current_version == 2
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, "test_bible.json")
+            bible.to_json(filepath)
+
+            restored = VersionedStoryBible.from_json(filepath)
+            # 版本计数与历史应完整恢复
+            assert restored.version_count == 3, f"版本数未恢复: {restored.version_count}"
+            assert restored.current_version == 2
+            assert len(restored.get_version_history()) == 3
+
+            # 回滚到最早的版本后，角色应回到初始状态
+            target = restored.rollback(0)
+            assert target.version_id == 0
+            assert len(restored.characters) == 0, "回滚后应回到初始（无角色）状态"
+            print("✅ 版本历史持久化与回滚正常")
+
+    def test_legacy_json_without_versions(self):
+        """旧格式 JSON（无 versions 字段）应能兼容加载"""
+        from core.story_bible import StoryBible, VersionedStoryBible
+        legacy = StoryBible(title="旧数据", genre="都市")
+        legacy.add_character(name="旧角色", gender="女")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, "legacy_bible.json")
+            legacy.to_json(filepath)
+
+            restored = VersionedStoryBible.from_json(filepath)
+            assert restored.meta["title"] == "旧数据"
+            assert len(restored.characters) == 1
+            # 旧数据应自动补一条“恢复初始版本”，保证可回滚
+            assert restored.version_count >= 1
+            assert restored.current_version == 0
+            target = restored.rollback(0)
+            assert target.version_id == 0
+            print("✅ 旧格式 JSON 兼容加载正常")
+
 
 class TestFix2_DotEnvLoading:
     """
@@ -295,6 +344,7 @@ class TestFix4_DataPersistence:
             assert restored.meta["title"] == "持久化测试"
             assert len(restored.characters) == 1
             assert list(restored.characters.values())[0].name == "主角"
+            assert restored.version_count >= 1  # 版本链应随保存/恢复保留
 
             print("✅ 数据保存/恢复循环正常")
 
@@ -435,6 +485,257 @@ class TestCoreFunctionality:
         print("✅ 上下文压缩功能正常")
 
 
+class TestVectorRag:
+    """
+    v0.3 验证：可选向量语义检索（RAG）
+    - 默认禁用态必须安全降级，不影响现有流程与 Demo 模式
+    - app.py 应已接入 SemanticIndex 与索引同步钩子
+    """
+
+    def test_vector_index_module_importable(self):
+        """core.vector_index 应可导入且提供 SemanticIndex"""
+        from core import vector_index
+        assert hasattr(vector_index, "SemanticIndex")
+        print("✅ 向量索引模块可导入")
+
+    def test_vector_disabled_safe(self):
+        """未启用/未安装依赖时，SemanticIndex 应安全降级、不抛异常"""
+        from core import vector_index
+
+        prev = vector_index.ENABLE_VECTOR
+        vector_index.ENABLE_VECTOR = False
+        try:
+            idx = vector_index.SemanticIndex()
+            assert idx.enabled is False
+            assert idx.add("doc", "示例内容") is False
+            assert idx.search("示例查询") == []
+            assert idx.similarity("a", "b") is None
+        finally:
+            vector_index.ENABLE_VECTOR = prev
+        print("✅ 向量索引禁用态安全降级")
+
+    def test_app_has_vector_integration(self):
+        """app.py 应包含向量索引接入与同步钩子"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "SemanticIndex" in content, "app.py 未引入 SemanticIndex"
+        assert "vector_index" in content, "app.py 未使用 vector_index 实例"
+        assert "sync_vector_index" in content, "app.py 缺少 sync_vector_index 索引同步方法"
+        print("✅ app.py 已接入向量索引")
+
+
+class TestContinuationWrite:
+    """
+    v0.3 验证：先写几章、再在已写基础上续写
+    - 后端：章号超出大纲时自动追加占位细纲并扩展总章数
+    - 前端：允许续写超过总章数（弹窗确认），并同步最新总章数
+    """
+
+    def test_backend_auto_extension(self):
+        """app.py 应包含自动扩章续写逻辑"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "_append_placeholder_outline" in content, "缺少占位细纲追加函数"
+        assert "续写扩展章" in content, "占位细纲缺少续写标记"
+        assert "total_chapters" in content, "缺少总章数扩展逻辑"
+        print("✅ 后端自动扩章逻辑已接入")
+
+    def test_frontend_allows_continuation(self):
+        """前端应允许续写超过总章数并同步更新"""
+        js_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "static", "js", "app.js")
+        with open(js_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "totalChapters" in content, "前端未使用总章数状态"
+        assert "confirm(" in content and "续写" in content, "前端缺少续写确认提示"
+        assert "writeChapter" in content and "writeAll" in content, "前端缺少写作调用函数"
+        print("✅ 前端续写交互已放开")
+
+    def test_status_returns_echo_fields(self):
+        """api/status 应返回续写回显所需字段"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert '"premise": project.premise' in content, "status 缺少 premise 回显"
+        assert '"next_chapter"' in content, "status 缺少 next_chapter"
+        assert '"chapter_meta"' in content, "status 缺少 chapter_meta"
+        print("✅ api/status 已包含续写回显字段")
+
+    def test_frontend_matches_html(self):
+        """前端应覆盖 index.html 引用的全部函数与元素 id"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        html_path = os.path.join(root, "templates", "index.html")
+        js_path = os.path.join(root, "static", "js", "app.js")
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        with open(js_path, "r", encoding="utf-8") as f:
+            js = f.read()
+
+        # index.html 引用的函数/回调必须在 app.js 中定义
+        for fn in ["startProject", "buildWorld", "generateOutline", "writeAll",
+                   "writeChapter", "confirmStep", "exportNovel", "resetProject",
+                   "showCostPanel", "showVersionPanel", "createCheckpoint",
+                   "resetCostStats", "closeModal", "switchTab", "loadChapter",
+                   "toggleChapterView"]:
+            assert f"function {fn}(" in js, f"app.js 缺少函数: {fn}"
+
+        # index.html 中通过 JS 查询的 id 应被 app.js 使用
+        for el_id in ["log-container", "chapter-select", "chapter-output",
+                      "current-step", "status-message", "bible-version",
+                      "single-chapter", "use-streaming", "chapter-count",
+                      "volume-count"]:
+            assert f"{el_id}" in js, f"app.js 未引用 HTML id: #{el_id}"
+        print("✅ 前端与 HTML 已对齐")
+
+
+class TestOutlineAgentV03:
+    """
+    v0.3 验证：大纲 Agent 两阶段生成 + 解析重试 + 结构校验/修复 + 分卷参数贯通
+    - 后端：章数超过上限先出分卷骨架再逐卷细纲；解析失败携带错误重试；输出程序化修复
+    - 接口：/api/stream-outline 接收 volume_count，生成后校验并修复
+    - 前端：提供分卷数量输入并传给后端
+    """
+
+    def test_backend_two_phase_machinery(self):
+        """outline_agent.py 应包含两阶段、重试、校验与修复的全部标记"""
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "agents", "outline_agent.py")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "MAX_CHAPTERS_PER_CALL" in content, "缺少单次生成上限常量"
+        assert "_generate_skeleton" in content, "缺少两阶段生成骨架函数"
+        assert "_generate_volume_detail" in content, "缺少逐卷细纲生成函数"
+        assert "_validate_output" in content, "缺少输出结构校验"
+        assert "_repair" in content, "缺少程序化自动修复"
+        assert "parse_error" in content, "缺少 JSON 解析失败重试判定"
+        assert "MAX_JSON_RETRIES" in content, "缺少解析重试上限常量"
+        print("✅ 大纲 Agent 两阶段/重试/修复机制已接入")
+
+    def test_stream_outline_accepts_volume_count(self):
+        """app.py 的 /api/stream-outline 应支持分卷数并校验修复结果"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert 'volume_count = data.get("volume_count", 1) or 1' in content, "stream-outline 未接收分卷数"
+        assert "MAX_CHAPTERS_PER_CALL" in content, "stream-outline 缺少两阶段阈值判断"
+        assert "agent._validate_output(result, chapter_count, volume_count)" in content, \
+            "stream-outline 缺少输出校验调用"
+        assert "agent._repair(result, chapter_count, volume_count)" in content, \
+            "stream-outline 缺少输出修复调用"
+        print("✅ /api/stream-outline 已贯通分卷数与校验修复")
+
+    def test_frontend_volume_input(self):
+        """前端应提供分卷数量输入并随大纲请求下发"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "templates", "index.html"), "r", encoding="utf-8") as f:
+            html = f.read()
+        with open(os.path.join(root, "static", "js", "app.js"), "r", encoding="utf-8") as f:
+            js = f.read()
+        assert 'id="volume-count"' in html, "HTML 缺少分卷数量输入框"
+        assert "volume_count: volumes" in js, "app.js 未下发分卷数"
+        print("✅ 前端分卷数量输入已接入")
+
+    def test_demo_mode_single_and_two_phase(self):
+        """Demo 模式下单阶段与两阶段都应稳定产出可修复结构"""
+        from agents.outline_agent import OutlineAgent
+
+        ws = {"world_name": "测试", "genre": "玄幻"}
+        backup = os.environ.get("OPENAI_API_KEY")
+        if backup is not None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            agent = OutlineAgent()
+            single = agent.run(world_setting=ws, chapter_count=10, volume_count=1)
+            assert single.get("volumes"), "单阶段产出缺少 volumes"
+            assert "estimated_total_chapters" in single, "单阶段产出缺少统计字段"
+
+            two = agent.run(world_setting=ws, chapter_count=20, volume_count=2,
+                            genre="玄幻", style="热血")
+            assert two.get("volumes"), "两阶段产出缺少 volumes"
+            assert "estimated_total_chapters" in two, "两阶段产出缺少统计字段"
+        finally:
+            if backup is not None:
+                os.environ["OPENAI_API_KEY"] = backup
+        print("✅ Demo 模式单/两阶段生成均正常")
+
+
+class TestPolisherAgentV03:
+    """
+    v0.3 验证：润色 Agent 差异化策略 + 专有名词保护 + 结构化输出解析 + 校验/strict 重试
+    - 后端：quality_score 匹配策略并注入 prompt；protected_terms 注入并校验；正文不再残留润色说明
+    - 流水线：润色传入评分/保护词并开启 strict；温度降到 0.4
+    """
+
+    def test_backend_markers(self):
+        """polisher_agent.py 应包含结构化输出、策略映射、保护词与校验标记"""
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "agents", "polisher_agent.py")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "===POLISHED_CONTENT===" in content, "缺少正文分隔符"
+        assert "run_detailed" in content, "缺少 run_detailed 详细接口"
+        assert "_STRATEGY_MAP" in content, "缺少差异化策略映射"
+        assert "protected_terms" in content, "缺少专有名词保护参数"
+        assert "_validate_output" in content, "缺少输出校验"
+        assert "strict" in content, "缺少 strict 重试参数"
+        assert "DEFAULT_TEMPERATURE" in content, "缺少默认温度常量"
+        print("✅ 润色 Agent v0.3 机制已接入")
+
+    def test_frozen_demo_registration_preserved(self):
+        """冻结约定：Polisher 的 Demo 注册行必须保持原样"""
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "agents", "polisher_agent.py")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert 'register_demo("Polisher", DEMO_POLISHED_CONTENT, estimated_tokens=3000)' in content, \
+            "Polisher Demo 注册行被改动"
+        print("✅ Polisher Demo 注册保持冻结")
+
+    def test_pipeline_wiring(self):
+        """app.py 润色应传入评分/保护词并开启 strict，温度应为 0.4"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "_collect_protected_terms" in content, "缺少保护词收集函数"
+        assert 'quality_score=check_result.get("overall_quality_score")' in content, \
+            "润色未传入质量评分"
+        assert "protected_terms=_collect_protected_terms()" in content, "润色未传入保护词"
+        assert "strict=True" in content, "润色未开启 strict"
+        assert "PolisherAgent(temperature=0.4)" in content, "润色温度未降到 0.4"
+        print("✅ 流水线润色接线完成")
+
+    def test_demo_run_behavior(self):
+        """Demo 模式下润色返回干净正文、解析出润色说明、策略匹配正确"""
+        from agents.polisher_agent import PolisherAgent
+
+        backup = os.environ.get("OPENAI_API_KEY")
+        if backup is not None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            agent = PolisherAgent()
+            assert agent.temperature == 0.4, "默认润色温度应为 0.4"
+
+            assert PolisherAgent._strategy_for(8.5)[0] == "微调"
+            assert PolisherAgent._strategy_for(6.5)[0] == "局部优化"
+            assert PolisherAgent._strategy_for(None)[0] == "自动判断"
+
+            result = agent.run_detailed(
+                text='沈炼握紧寒江剑，低声说道："耐得住寂寞，方能成大器。"他转身下山。',
+                quality_score=6.5,
+                protected_terms=["沈炼", "寒江剑"],
+                strict=True,
+            )
+            assert result.content, "润色正文为空"
+            assert "【润色说明】" not in result.content, "正文残留润色说明"
+            assert result.notes, "未解析出润色说明"
+        finally:
+            if backup is not None:
+                os.environ["OPENAI_API_KEY"] = backup
+        print("✅ Demo 润色行为正常")
+
+
 # ============================================================
 # 主入口：运行所有测试
 # ============================================================
@@ -452,6 +753,10 @@ def run_all_tests():
         TestFix3_ThreadSafety,
         TestFix4_DataPersistence,
         TestCoreFunctionality,
+        TestVectorRag,
+        TestContinuationWrite,
+        TestOutlineAgentV03,
+        TestPolisherAgentV03,
     ]
 
     total = 0

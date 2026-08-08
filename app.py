@@ -27,25 +27,32 @@ from flask import Flask, render_template, request, jsonify, send_from_directory,
 # ============================================================
 try:
     from dotenv import load_dotenv
+
     load_dotenv()  # 现在可以正确读取 .env 文件了
 except ImportError:
     pass  # python-dotenv 未安装时静默跳过
 
 from core.story_bible import VersionedStoryBible, ChapterSummary
+from core.state import StoryStateTracker
+from core.vector_index import SemanticIndex
 from agents import (
     WorldBuilderAgent,
     OutlineAgent,
     WriterAgent,
     CheckerAgent,
     PolisherAgent,
+    ChapterSummarizerAgent,
 )
 from agents.base import tracker as token_tracker
+from agents.checker_agent import QUALITY_FLOOR
+from agents.outline_agent import MAX_CHAPTERS_PER_CALL
 
 app = Flask(
     __name__,
     template_folder="templates",
     static_folder="static",
 )
+
 
 # ============================================================
 # 全局状态管理（v0.2 增强 + 修复 #3：线程安全）
@@ -56,11 +63,11 @@ class PipelineStep:
     IDLE = "idle"
     INPUT = "input"
     WORLD_BUILDING = "world_building"
-    WORLD_BUILT = "world_built"          # 等待用户确认
+    WORLD_BUILT = "world_built"  # 等待用户确认
     OUTLINING = "outlining"
     OUTLINE_GENERATED = "outline_generated"  # 等待用户确认
     WRITING = "writing"
-    CHAPTER_DONE = "chapter_done"         # 等待用户确认
+    CHAPTER_DONE = "chapter_done"  # 等待用户确认
     DONE = "done"
     ERROR = "error"
 
@@ -82,6 +89,8 @@ class NovelProject:
         self.bible: VersionedStoryBible = VersionedStoryBible()
         self.outline = {}
         self.chapters = {}  # {chapter_num: {"draft": str, "polished": str, "check_report": dict, "retry_count": int}}
+        self.vector_index = SemanticIndex()  # 可选语义索引（默认禁用/降级）
+        self.state_tracker = StoryStateTracker(index=self.vector_index)  # 跨章状态（角色/伏笔/前情/历史问题）
         self.current_step = PipelineStep.INPUT
         self.status_message = "准备就绪"
         self.is_running = False
@@ -131,6 +140,10 @@ class NovelProject:
                 with open(os.path.join(self.DATA_DIR, "project_meta.json"), "w", encoding="utf-8") as f:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
 
+                # 保存跨章状态追踪器
+                with open(os.path.join(self.DATA_DIR, "state.json"), "w", encoding="utf-8") as f:
+                    json.dump(self.state_tracker.to_dict(), f, ensure_ascii=False, indent=2)
+
             except Exception as e:
                 print(f"[警告] 保存状态失败: {e}")
 
@@ -163,7 +176,7 @@ class NovelProject:
                 if os.path.exists(chapters_path):
                     with open(chapters_path, "r", encoding="utf-8") as f:
                         self.chapters = json.load(f)
-                    # 将键转换为整数
+                        # 将键转换为整数
                         self.chapters = {int(k): v for k, v in self.chapters.items()}
 
                 # 恢复元状态
@@ -178,6 +191,16 @@ class NovelProject:
                 self.write_stats = meta.get("write_stats", self.write_stats)
                 self.logs = meta.get("logs", [])
 
+                # 恢复跨章状态追踪器
+                state_path = os.path.join(self.DATA_DIR, "state.json")
+                if os.path.exists(state_path):
+                    with open(state_path, "r", encoding="utf-8") as f:
+                        self.state_tracker = StoryStateTracker.from_dict(json.load(f))
+                self.state_tracker.index = self.vector_index
+
+                # 从恢复的故事圣经重建语义索引（幂等）
+                self.sync_vector_index()
+
                 print(f"[恢复] 成功恢复项目状态 | 书名:{self.bible.meta.get('title', '未命名')} | "
                       f"已写{len(self.chapters)}章")
                 return True
@@ -185,6 +208,37 @@ class NovelProject:
             except Exception as e:
                 print(f"[警告] 恢复状态失败: {e}，将使用空白状态")
                 return False
+
+    def sync_vector_index(self):
+        """把当前故事圣经的实体/摘要同步进向量索引（幂等，按内容去重）。"""
+        if not self.vector_index.enabled:
+            return
+        with self._lock:
+            bible = self.bible
+            for c in bible.characters.values():
+                self.vector_index.add(f"char:{c.id}", f"【角色】{c.to_text()}")
+            for loc in bible.locations.values():
+                self.vector_index.add(
+                    f"loc:{loc.id}",
+                    f"【地点】{loc.name}: {loc.description or ''} 重要性:{loc.significance or '无'}",
+                )
+            for it in bible.items.values():
+                self.vector_index.add(
+                    f"item:{it.id}",
+                    f"【道具】{it.name}: {it.description or ''} 能力:{it.special_ability or '无'}",
+                )
+            for fs in bible.foreshadowings.values():
+                status = "（已回收）" if fs.resolved else ""
+                self.vector_index.add(
+                    f"fs:{fs.id}",
+                    f"【伏笔】{fs.content} 埋设于:{fs.planted_in} 提示:{fs.hint or '无'}{status}",
+                )
+            for num, s in bible.chapter_summaries.items():
+                self.vector_index.add(f"sum:{num}", f"第{num}章 {s.title}：{s.summary}")
+            if bible.world_notes:
+                self.vector_index.add("world:notes", f"【世界观】{bible.world_notes}")
+            if bible.style_guide:
+                self.vector_index.add("world:style", f"【文风】{bible.style_guide}")
 
 
 # 全局项目实例
@@ -305,15 +359,20 @@ def _execute_write_chapter_with_retry(chapter_num: int = None, **kwargs):
     context = project.bible.build_context_for_chapter(
         chapter_num=chapter_num,
         chapter_outline=json.dumps(chapter_outline, ensure_ascii=False),
+        index=project.vector_index,
     )
 
     writer = WriterAgent(temperature=0.85)
     checker = CheckerAgent(temperature=0.3)
-    polisher = PolisherAgent(temperature=0.6)
+    polisher = PolisherAgent(temperature=0.4)
 
     draft = None
     check_result = None
     retry_count = 0
+
+    # 首次检查前把故事圣经角色同步进追踪器，并装配 Checker 的跨章入参
+    _seed_tracker_characters()
+    checker_inputs = project.state_tracker.build_checker_inputs()
 
     for attempt in range(project.MAX_RETRIES + 1):  # 初始写 + 最多3次重写
         if attempt > 0:
@@ -323,18 +382,14 @@ def _execute_write_chapter_with_retry(chapter_num: int = None, **kwargs):
             _log(f"🔄 第 {chapter_num} 章第 {attempt} 次重写...")
 
             # 构建修改建议文本
-            issues_text = "\n".join([
-                f"- [{i.get('severity', '?')}] {i.get('detail', '')}"
-                f"\n  建议：{i.get('suggestion', '')}"
-                for i in check_result.get("issues", [])
-                if i.get("severity") in ("error", "warning")
-            ])
+            revision_notes = _build_revision_notes(check_result, chapter_num)
 
             # 重写：传入 revision_notes
             draft = writer.run(
                 chapter_outline=chapter_outline,
                 context=context,
-                revision_notes=f"以下是检查报告发现的问题，请在保持原有通过部分的基础上进行修改：\n\n{issues_text}",
+                revision_notes=revision_notes,
+                original_text=draft,
             )
         else:
             # 首次写作
@@ -352,7 +407,7 @@ def _execute_write_chapter_with_retry(chapter_num: int = None, **kwargs):
             }
 
         _log(f"📝 第 {chapter_num} 章初稿完成 ({len(draft)} 字)" +
-              (f" [重写 #{retry_count}]" if retry_count > 0 else ""))
+             (f" [重写 #{retry_count}]" if retry_count > 0 else ""))
 
         # 检查
         with project._lock:
@@ -363,26 +418,30 @@ def _execute_write_chapter_with_retry(chapter_num: int = None, **kwargs):
             chapter_text=draft,
             chapter_num=chapter_num,
             story_bible_summary=bible_summary,
+            **checker_inputs,
         )
 
         with project._lock:
             project.chapters[chapter_num]["check_report"] = check_result
-        passed = check_result.get("passed", True)
+        needs_revision = check_result.get(
+            "needs_revision", not check_result.get("passed", True)
+        )
 
-        if passed:
+        if not needs_revision:
             score = check_result.get('overall_quality_score', '?')
             _log(f"✅ 第 {chapter_num} 章检查通过 (评分: {score})" +
-                  (f" [经过 {retry_count} 次重写]" if retry_count > 0 else ""))
+                 (f" [经过 {retry_count} 次重写]" if retry_count > 0 else ""))
             break  # 通过了，退出循环
         else:
             errors = [i for i in check_result.get("issues", []) if i.get("severity") == "error"]
             warnings = [i for i in check_result.get("issues", []) if i.get("severity") == "warning"]
-            _log(f"⚠️ 第 {chapter_num} 章发现 {len(errors)} 个错误, {len(warnings)} 个警告")
+            _log(f"⚠️ 第 {chapter_num} 章需要修订: {len(errors)} 个错误, {len(warnings)} 个警告" +
+                 f", 评分 {check_result.get('overall_quality_score', '?')}")
 
             if attempt < project.MAX_RETRIES:
                 continue  # 继续重写
             else:
-                _log(f"❌ 第 {chapter_num} 章经过 {project.MAX_RETRIES} 次重写仍有问题，使用当前版本")
+                _log(f"❌ 第 {chapter_num} 章经过 {project.MAX_RETRIES} 次重写仍需要修订，使用当前版本")
                 with project._lock:
                     project.write_stats["failed_chapters"].append(chapter_num)
                 break  # 达到最大重试次数，使用当前版本
@@ -400,6 +459,9 @@ def _execute_write_chapter_with_retry(chapter_num: int = None, **kwargs):
     polished = polisher.run(
         text=draft,
         style_guide=project.bible.style_guide,
+        quality_score=check_result.get("overall_quality_score") if check_result else None,
+        protected_terms=_collect_protected_terms(),
+        strict=True,
     )
 
     with project._lock:
@@ -408,6 +470,10 @@ def _execute_write_chapter_with_retry(chapter_num: int = None, **kwargs):
 
     # 提取摘要并更新故事圣经
     _extract_and_update_summary(chapter_num, draft)
+
+    # 回写跨章状态追踪器（伏笔台账/前情摘要/历史问题），并同步故事圣经
+    if check_result:
+        _writeback_state(chapter_num, check_result)
 
     # 创建版本快照
     with project._lock:
@@ -469,15 +535,65 @@ def _import_world_to_bible(world_data: dict):
             for f in factions:
                 project.bible.world_notes += f"- **{f['name']}** 首领:{f['leader']} 目标:{f['goal']}\n"
 
+    # 同步角色/地点/设定进语义索引
+    project.sync_vector_index()
+
 
 def _get_chapter_outline(chapter_num: int) -> dict:
-    """从大纲中获取指定章节的细纲"""
+    """从大纲中获取指定章节的细纲。
+
+    若章号超出当前大纲范围（续写场景），自动追加一条占位细纲并扩展总章数，
+    使基于前文的续写有基本指引且不会写乱章号。
+    """
     volumes = project.outline.get("volumes", [])
     for vol in volumes:
         for ch in vol.get("chapters", []):
             if ch.get("num") == chapter_num:
                 return ch
-    return {"num": chapter_num, "title": f"第{chapter_num}章", "scenes": [], "conflict": "", "hook": ""}
+
+    return _append_placeholder_outline(chapter_num, volumes)
+
+
+def _append_placeholder_outline(chapter_num: int, volumes: list) -> dict:
+    """为续写章追加占位细纲，写入末卷并按 num 排序，同时扩展总章数并落盘。"""
+    placeholder = {
+        "num": chapter_num,
+        "title": f"第{chapter_num}章",
+        "scenes": [],
+        "conflict": "",
+        "hook": "",
+        "summary_type": "续写扩展章",
+    }
+
+    with project._lock:
+        if not volumes:
+            volumes = [{"volume_num": 1, "volume_title": "续写卷", "chapters": []}]
+            project.outline["volumes"] = volumes
+        target_vol = volumes[-1]
+        target_vol.setdefault("chapters", []).append(placeholder)
+        # 保持章节按 num 排序，避免写入乱序
+        target_vol["chapters"].sort(key=lambda c: c.get("num", 0))
+
+        if project.total_chapters < chapter_num:
+            project.total_chapters = chapter_num
+
+        # 更新大纲与元状态（outline.json / chapters.json / state.json 一起落盘）
+        project.save_state()
+    return placeholder
+
+
+def _collect_protected_terms() -> list:
+    """收集需在润色时原样保留的专有名词（角色/别名/地点/道具）"""
+    terms = []
+    with project._lock:
+        for c in project.bible.characters.values():
+            terms.append(c.name)
+            terms.extend(c.alias)
+        for loc in project.bible.locations.values():
+            terms.append(loc.name)
+        for it in project.bible.items.values():
+            terms.append(it.name)
+    return [t for t in dict.fromkeys(terms) if t]
 
 
 def _build_bible_summary_for_check() -> str:
@@ -502,33 +618,78 @@ def _build_bible_summary_for_check() -> str:
     return "\n".join(parts)
 
 
+def _seed_tracker_characters() -> None:
+    """首次进入检查前，把故事圣经中的角色同步为追踪器的初始状态。"""
+    with project._lock:
+        if project.state_tracker.character_states:
+            return
+        for c in project.bible.characters.values():
+            project.state_tracker.upsert_character(c.name, alive=c.status != "dead")
+
+
+def _build_revision_notes(check_result: dict, chapter_num: int) -> str:
+    """把检查结果汇总为重写反馈；评分过低但无具体 issue 时给出整体提示。"""
+    lines = []
+    for i in check_result.get("issues", []):
+        if i.get("severity") in ("error", "warning"):
+            lines.append(f"- [{i.get('severity', '?')}] {i.get('detail', '')}"
+                         f"\n  建议：{i.get('suggestion', '')}")
+    if not lines and check_result.get("overall_quality_score", 10) < QUALITY_FLOOR:
+        score = check_result["overall_quality_score"]
+        lines.append(f"- [整体质量] 综合评分 {score:.1f} 低于阈值 {QUALITY_FLOOR}，"
+                     f"请针对文笔、节奏或结构薄弱处提升整体质量。")
+    return ("以下是检查报告发现的问题，请在保持原有通过部分的基础上修改：\n\n"
+            + "\n".join(lines))
+
+
+def _writeback_state(chapter_num: int, check_result: dict) -> None:
+    """检查定稿后回写追踪器（伏笔台账/前情摘要/历史问题），并同步故事圣经。"""
+    with project._lock:
+        s = project.bible.chapter_summaries.get(chapter_num)
+        digest = ""
+        if s:
+            digest = s.summary or "；".join(s.key_events or [])
+
+        tracker = project.state_tracker
+        tracker.ingest_report(chapter_num, check_result, digest)
+
+        # 角色状态变化（来自摘要提取的 ChapterSummary.character_state_changes）
+        if s and s.character_state_changes:
+            for name, change in s.character_state_changes.items():
+                fields = change if isinstance(change, dict) else {"状态": change}
+                tracker.upsert_character(str(name), **fields)
+
+        # 伏笔台账与故事圣经双向一致（埋设/回收）
+        for note in check_result.get("foreshadowing_notes", []):
+            if note.startswith("【埋设】"):
+                content = note.removeprefix("【埋设】").strip()
+                if not any(
+                    not fs.resolved and StoryStateTracker._similar(
+                        fs.content, content, index=project.vector_index)
+                    for fs in project.bible.foreshadowings.values()
+                ):
+                    project.bible.add_foreshadowing(content=content,
+                                                    planted_in=f"第{chapter_num}章")
+            elif note.startswith("【回收】"):
+                content = note.removeprefix("【回收】").strip()
+                for fs in project.bible.foreshadowings.values():
+                    if not fs.resolved and StoryStateTracker._similar(
+                            fs.content, content, index=project.vector_index):
+                        project.bible.resolve_foreshadowing(fs.id, f"第{chapter_num}章")
+                        break
+
+    # 伏笔台账变化同步进语义索引
+    project.sync_vector_index()
+
+
 def _extract_and_update_summary(chapter_num: int, text: str):
     """提取章节摘要并更新故事圣经"""
-    from agents.base import call_llm
-
-    prompt = """你是一位小说编辑。请为以下章节提取结构化摘要。
-以 JSON 格式输出：
-{
-  "chapter_num": 章号,
-  "title": "标题",
-  "summary": "200字以内摘要",
-  "characters_present": ["出场角色"],
-  "key_events": ["关键事件"],
-  "character_state_changes": {},
-  "new_foreshadowing": [],
-  "resolved_foreshadowing": []
-}
-
-只输出 JSON，不要任何解释。"""
+    summarizer = ChapterSummarizerAgent(temperature=0.3)
 
     try:
-        response = call_llm(prompt, text[:3000], temperature=0.3, max_tokens=1000,
-                           agent_name="SummaryExtractor", force_json=True)
-        clean = response.strip()
-        if clean.startswith("```"):
-            lines = clean.split("\n")
-            clean = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-        summary_data = json.loads(clean)
+        summary_data = summarizer.run(chapter_text=text, chapter_num=chapter_num)
+        if not isinstance(summary_data, dict) or summary_data.get("parse_error"):
+            raise ValueError("摘要解析失败")
         summary = ChapterSummary(**summary_data)
         with project._lock:
             project.bible.add_chapter_summary(summary)
@@ -542,6 +703,9 @@ def _extract_and_update_summary(chapter_num: int, text: str):
         )
         with project._lock:
             project.bible.add_chapter_summary(summary)
+
+    # 章节摘要同步进语义索引（供前情提要语义召回）
+    project.sync_vector_index()
 
 
 def _log(message: str):
@@ -641,9 +805,9 @@ def api_write_all():
             project.status_message = "全部章节写作完成！"
             stats = project.write_stats
         _log(f"🎉 全部章节写作完成！" +
-              f"共 {stats['total_chapters_written']} 章，" +
-              f"重写 {stats['total_retries']} 次，" +
-              f"失败 {len(stats['failed_chapters'])} 章")
+             f"共 {stats['total_chapters_written']} 章，" +
+             f"重写 {stats['total_retries']} 次，" +
+             f"失败 {len(stats['failed_chapters'])} 章")
         project.save_state()
 
     thread = threading.Thread(target=write_all_chapters)
@@ -694,6 +858,7 @@ def api_stream_write(chapter_num):
             context = project.bible.build_context_for_chapter(
                 chapter_num=chapter_num,
                 chapter_outline=json_mod.dumps(chapter_outline, ensure_ascii=False),
+                index=project.vector_index,
             )
 
             writer = WriterAgent(temperature=0.85)
@@ -701,31 +866,307 @@ def api_stream_write(chapter_num):
             # 流式调用 LLM
             full_content = []
             for chunk in writer._call_llm_stream(
-                user_msg=(
-                    f"请根据以下大纲和设定，撰写完整的小说章节。\n\n"
-                    f"## 故事设定与上下文\n{context}\n\n"
-                    f"## 本章大纲\n{json_mod.dumps(chapter_outline, ensure_ascii=False, indent=2)}\n\n"
-                    f"请直接输出正文，以'第X章 标题'开头。"
-                ),
+                    user_msg=(
+                            f"请根据以下大纲和设定，撰写完整的小说章节。\n\n"
+                            f"## 故事设定与上下文\n{context}\n\n"
+                            f"## 本章大纲\n{json_mod.dumps(chapter_outline, ensure_ascii=False, indent=2)}\n\n"
+                            f"请先输出【写作笔记】完成四步构思，再输出【正文】。\n"
+                            f"展示而非讲述，钩子强度以大纲 hook_type 为准。"
+                    ),
             ):
                 full_content.append(chunk)
                 yield f"data: {json_mod.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
 
             final_content = "".join(full_content)
 
-            # 保存结果
-            with project._lock:
-                project.chapters[chapter_num] = {
-                    "draft": final_content,
-                    "polished": "",
-                    "check_report": None,
-                    "retry_count": 0,
-                }
+        except Exception as e:
+            yield f"data: {json_mod.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+            return
 
-            yield f"data: {json_mod.dumps({'type': 'done', 'full_content': final_content, 'word_count': len(final_content)}, ensure_ascii=False)}\n\n"
+        # 使用 WriterAgent 的 _extract_body 剥离写作笔记，只保留正文
+        final_content = WriterAgent._extract_body(final_content)
+
+        # 保存结果
+        with project._lock:
+            project.chapters[chapter_num] = {
+                "draft": final_content,
+                "polished": "",
+                "check_report": None,
+                "retry_count": 0,
+            }
+
+        yield f"data: {json_mod.dumps({'type': 'done', 'full_content': final_content, 'word_count': len(final_content)}, ensure_ascii=False)}\n\n"
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/stream-world", methods=["POST"])
+def api_stream_world():
+    """
+    流式世界构建端点 —— 使用 SSE 实时返回生成进度
+
+    改进点：用户可以实时看到世界构建过程，无需等待完成
+    """
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    def generate():
+        import json as json_mod
+
+        yield f"data: {json_mod.dumps({'type': 'start', 'step': 'world_build'}, ensure_ascii=False)}\n\n"
+
+        try:
+            with project._lock:
+                project.current_step = PipelineStep.WORLD_BUILDING
+                project.status_message = "正在构建世界..."
+            _log("🌍 开始流式构建世界...")
+
+            agent = WorldBuilderAgent(temperature=0.9)
+
+            # 构建用户消息（与 run 方法一致）
+            user_msg = (
+                f"请根据以下创意构建完整的小说世界观。\n"
+                f"## 创意 premise\n{project.premise}\n\n"
+                f"## 类型 genre\n{project.genre}"
+            )
+
+            # 流式调用 LLM
+            full_content = []
+            for chunk in agent._call_llm_stream(user_msg):
+                full_content.append(chunk)
+                yield f"data: {json_mod.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
+
+            final_content = "".join(full_content)
+            result = agent._parse_json_response(final_content)
+
+            if isinstance(result, str) or result.get("parse_error"):
+                yield f"data: {json_mod.dumps({'type': 'error', 'message': 'JSON 解析失败'}, ensure_ascii=False)}\n\n"
+                return
+
+            # 将结果写入故事圣经
+            _import_world_to_bible(result)
+
+            # 创建版本快照
+            with project._lock:
+                project.bible.checkpoint("世界构建完成")
+                project.bible.to_json("data/story_bible.json")
+                project.current_step = PipelineStep.WORLD_BUILT
+                project.status_message = "世界观构建完成！请确认后继续。"
+
+            _log(f"✅ 世界观构建完成：{result.get('world_name', '未知世界')}")
+            project.save_state()
+
+            yield f"data: {json_mod.dumps({'type': 'done', 'world': result}, ensure_ascii=False)}\n\n"
 
         except Exception as e:
             yield f"data: {json_mod.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+            with project._lock:
+                project.current_step = PipelineStep.ERROR
+                project.status_message = f"错误：{str(e)}"
+            project.is_running = False
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/stream-outline", methods=["POST"])
+def api_stream_outline():
+    """
+    流式大纲生成端点 —— 使用 SSE 实时返回生成进度
+
+    改进点：用户可以实时看到大纲生成过程，无需等待完成
+    """
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    data = request.json or {}
+    chapter_count = data.get("chapter_count", 10)
+    volume_count = data.get("volume_count", 1) or 1
+
+    def generate():
+        import json as json_mod
+
+        yield f"data: {json_mod.dumps({'type': 'start', 'step': 'outline', 'chapter_count': chapter_count}, ensure_ascii=False)}\n\n"
+
+        try:
+            with project._lock:
+                project.current_step = PipelineStep.OUTLINING
+                project.status_message = "正在生成大纲..."
+            _log("📋 开始流式生成大纲...")
+
+            agent = OutlineAgent(temperature=0.8)
+            world_dict = project.bible.to_dict()
+
+            if chapter_count > MAX_CHAPTERS_PER_CALL:
+                # 长篇幅：走两阶段生成（分卷骨架 → 逐卷细纲），内部含解析重试与结构修复
+                with project._lock:
+                    project.status_message = f"章数较多（{chapter_count} 章），正在分两阶段生成大纲..."
+                yield f"data: {json_mod.dumps({'type': 'phase', 'message': '两阶段生成：先分卷骨架，再逐卷细化章节…'}, ensure_ascii=False)}\n\n"
+                try:
+                    result = agent.run(
+                        world_setting=world_dict,
+                        chapter_count=chapter_count,
+                        volume_count=volume_count,
+                    )
+                except Exception as e:
+                    yield f"data: {json_mod.dumps({'type': 'error', 'message': f'大纲生成失败：{e}'}, ensure_ascii=False)}\n\n"
+                    return
+            else:
+                # 短篇幅：构建用户消息（与 run 方法一致）并流式输出
+                user_msg = (
+                    f"请根据以下世界观设定，生成分层大纲结构。\n\n"
+                    f"## 世界观设定\n{json_mod.dumps(world_dict, ensure_ascii=False, indent=2)}\n\n"
+                    f"## 要求\n"
+                    f"- 总章数：{chapter_count} 章\n"
+                    f"- 总卷数：{volume_count} 卷\n"
+                    f"- 请输出包含总纲、分卷大纲、章节细纲的完整 JSON"
+                )
+
+                full_content = []
+                for chunk in agent._call_llm_stream(user_msg):
+                    full_content.append(chunk)
+                    yield f"data: {json_mod.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
+
+                final_content = "".join(full_content)
+                result = agent._parse_json_response(final_content)
+
+                if isinstance(result, str) or result.get("parse_error"):
+                    yield f"data: {json_mod.dumps({'type': 'error', 'message': 'JSON 解析失败'}, ensure_ascii=False)}\n\n"
+                    return
+
+                # 输出结构校验 + 程序化修复（与 run 方法保持一致）
+                issues = agent._validate_output(result, chapter_count, volume_count)
+                if issues:
+                    try:
+                        result = agent._repair(result, chapter_count, volume_count)
+                    except Exception as e:
+                        yield f"data: {json_mod.dumps({'type': 'error', 'message': f'大纲结构无效：{e}'}, ensure_ascii=False)}\n\n"
+                        return
+
+            # 保存结果（两条路径共用）
+            with project._lock:
+                project.outline = result
+                project.total_chapters = chapter_count
+
+                # 保存大纲
+                with open("data/outline.json", "w", encoding="utf-8") as f:
+                    json.dump(result, f, ensure_ascii=False, indent=2)
+
+                # 创建版本快照
+                project.bible.checkpoint(f"大纲生成完成 ({chapter_count}章)")
+                project.current_step = PipelineStep.OUTLINE_GENERATED
+                project.status_message = f"大纲生成完成！共 {chapter_count} 章。请确认后开始写作。"
+
+            _log(f"✅ 大纲生成完成：{chapter_count} 章")
+            project.save_state()
+
+            yield f"data: {json_mod.dumps({'type': 'done', 'outline': result}, ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            yield f"data: {json_mod.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+            with project._lock:
+                project.current_step = PipelineStep.ERROR
+                project.status_message = f"错误：{str(e)}"
+            project.is_running = False
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/stream-all", methods=["POST"])
+def api_stream_all():
+    """
+    流式批量写作端点 —— 使用 SSE 实时返回每章的写作进度
+
+    改进点：逐章流式写作，用户可以看到每一章的实时生成进度
+    """
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    def generate():
+        import json as json_mod
+
+        total = project.total_chapters or len(
+            project.outline.get("volumes", [{}])[0].get("chapters", [])
+        )
+
+        yield f"data: {json_mod.dumps({'type': 'start', 'step': 'write_all', 'total_chapters': total}, ensure_ascii=False)}\n\n"
+
+        try:
+            for ch in range(1, total + 1):
+                # 发送章节开始事件
+                yield f"data: {json_mod.dumps({'type': 'chapter_start', 'chapter_num': ch}, ensure_ascii=False)}\n\n"
+
+                # 获取细纲和上下文
+                chapter_outline = _get_chapter_outline(ch)
+                context = project.bible.build_context_for_chapter(
+                    chapter_num=ch,
+                    chapter_outline=json_mod.dumps(chapter_outline, ensure_ascii=False),
+                    index=project.vector_index,
+                )
+
+                writer = WriterAgent(temperature=0.85)
+
+                # 流式调用 LLM 写作当前章节
+                full_content = []
+                for chunk in writer._call_llm_stream(
+                        user_msg=(
+                                f"请根据以下大纲和设定，撰写完整的小说章节。\n\n"
+                                f"## 故事设定与上下文\n{context}\n\n"
+                                f"## 本章大纲\n{json_mod.dumps(chapter_outline, ensure_ascii=False, indent=2)}\n\n"
+                                f"请先输出【写作笔记】完成四步构思，再输出【正文】。\n"
+                                f"展示而非讲述，钩子强度以大纲 hook_type 为准。"
+                        ),
+                ):
+                    full_content.append(chunk)
+                    yield f"data: {json_mod.dumps({'type': 'chunk', 'chapter_num': ch, 'content': chunk}, ensure_ascii=False)}\n\n"
+
+                final_content = "".join(full_content)
+
+                # 剥离写作笔记，只保留正文
+                final_content = WriterAgent._extract_body(final_content)
+
+                # 保存结果
+                with project._lock:
+                    project.chapters[ch] = {
+                        "draft": final_content,
+                        "polished": "",
+                        "check_report": None,
+                        "retry_count": 0,
+                    }
+
+                # 发送章节完成事件
+                yield f"data: {json_mod.dumps({'type': 'chapter_done', 'chapter_num': ch, 'word_count': len(final_content)}, ensure_ascii=False)}\n\n"
+
+                _log(f"📝 第 {ch}/{total} 章写作完成")
+
+                # 短暂暂停，避免请求过快
+                time.sleep(0.5)
+
+            # 全部完成
+            with project._lock:
+                project.current_step = PipelineStep.DONE
+                project.status_message = "全部章节写作完成！"
+                stats = project.write_stats
+
+            _log(f"🎉 全部章节写作完成！" +
+                 f"共 {stats['total_chapters_written']} 章，" +
+                 f"重写 {stats['total_retries']} 次，" +
+                 f"失败 {len(stats['failed_chapters'])} 章")
+            project.save_state()
+
+            yield f"data: {json_mod.dumps({'type': 'done', 'stats': stats}, ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            yield f"data: {json_mod.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+            with project._lock:
+                project.current_step = PipelineStep.ERROR
+                project.status_message = f"错误：{str(e)}"
+            project.is_running = False
 
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
@@ -771,6 +1212,7 @@ def api_bible_rollback(version_id):
     try:
         target = project.bible.rollback(version_id)
         project.bible.to_json("data/story_bible.json")
+        project.sync_vector_index()  # 回滚后重建语义索引，保持一致
         _log(f"📦 Story Bible 已回滚到版本 {version_id}")
         return jsonify({
             "status": "rolled_back",
@@ -800,8 +1242,12 @@ def api_bible_checkpoint():
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
-    """获取当前状态（v0.2 增强）"""
+    """获取当前状态（v0.2 增强 + v0.3 续写回显）"""
     with project._lock:
+        written = set(project.chapters.keys())
+        next_ch = 1
+        while next_ch in written:
+            next_ch += 1
         return jsonify({
             "step": project.current_step,
             "message": project.status_message,
@@ -811,12 +1257,23 @@ def api_status():
             "written_chapters": list(project.chapters.keys()),
             "logs": project.logs[-20:],
             "bible_title": project.bible.meta.get("title", ""),
-            "genre": project.bible.meta.get("genre", ""),
+            "genre": project.genre,
             "character_count": len(project.bible.characters),
             "foreshadowing_count": len(project.bible.foreshadowings),
             # v0.2 新增字段
             "bible_version": project.bible.current_version,
             "write_stats": project.write_stats,
+            # v0.3 续写回显字段
+            "premise": project.premise,
+            "next_chapter": next_ch,
+            "chapter_meta": {
+                num: {
+                    "word_count": len(ch.get("polished") or ch.get("draft") or ""),
+                    "has_polished": bool(ch.get("polished")),
+                    "retry_count": ch.get("retry_count", 0),
+                }
+                for num, ch in project.chapters.items()
+            },
         })
 
 

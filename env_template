@@ -30,6 +30,13 @@ OPENAI_API_KEY=sk-your-key-here
 # 备用模型（主力模型失败时自动切换）
 # LLM_FALLBACK_MODEL=gpt-4o-mini
 
+# 可选：语义检索（RAG）——默认关闭，开启需先安装向量依赖
+# ENABLE_VECTOR=off
+# VECTOR_MODEL=BAAI/bge-small-zh-v1.5
+#
+# 安装方式（首次会联网下载模型，约 100MB）：
+#   pip install -r requirements-rag.txt
+
 
 # ============================================================
 # 🔽 常用服务商配置模板（取消注释即可使用）

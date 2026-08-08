@@ -146,54 +146,90 @@ tracker = TokenTracker()
 # ============================================================
 
 MODEL_ROUTING = {
+    # 世界构建：需要高创造力，用强模型
     "WorldBuilder": {
-        "primary": "gpt-4o",
-        "fallback": "deepseek-reasoner",
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o"),
         "temperature": 0.9,
         "max_tokens": 4096,
-        "reasoning": True,
+        "reasoning": False,
     },
+    # 大纲规划：需要结构化思维，中等温度
     "OutlineArchitect": {
-        "primary": "gpt-4o",
-        "fallback": "claude-3.5-sonnet",
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
         "temperature": 0.8,
-        "max_tokens": 6000,
+        "max_tokens": 8192,
         "reasoning": False,
     },
+    # 正文写作：需要文采，高温度
     "Writer": {
-        "primary": "gpt-4o-mini",
-        "fallback": "deepseek-chat",
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
         "temperature": 0.85,
-        "max_tokens": 6000,
+        "max_tokens": 8192,
         "reasoning": False,
     },
+    # 检查员：需要严谨，低温度，可用弱模型
     "PlotChecker": {
-        "primary": "gpt-4o-mini",
-        "fallback": "qwen-plus",
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
         "temperature": 0.3,
-        "max_tokens": 3000,
+        "max_tokens": 4096,
         "reasoning": False,
     },
+    # 润色师：中等温度
     "Polisher": {
-        "primary": "gpt-4o-mini",
-        "fallback": "deepseek-chat",
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
         "temperature": 0.6,
-        "max_tokens": 6000,
+        "max_tokens": 8192,
+        "reasoning": False,
+    },
+    # 摘要提取：需要严谨与精炼，低温度、短输出
+    "ChapterSummarizer": {
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
+        "temperature": 0.3,
+        "max_tokens": 1024,
         "reasoning": False,
     },
 }
 
 
 def get_model_config(agent_name: str) -> dict:
-    """获取指定 Agent 的模型配置"""
+    """
+    获取指定 Agent 的模型配置
+
+    v0.2 修复：优先使用 .env 环境变量中的模型配置，
+    MODEL_ROUTING 只作为 temperature/max_tokens 等参数的参考。
+    这样用户在 .env 中设置的 LLM_MODEL 会真正生效。
+    """
+    # 从环境变量读取用户配置的模型（最高优先级）
+    env_primary = os.environ.get("LLM_MODEL", "").strip()
+    env_fallback = os.environ.get("LLM_FALLBACK_MODEL", "").strip()
+
+    # 获取路由表中的基础配置（temperature、max_tokens 等）
+    routing_config = MODEL_ROUTING.get(agent_name, {})
     default_config = {
-        "primary": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
-        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
-        "temperature": 0.7,
-        "max_tokens": 4096,
-        "reasoning": False,
+        "primary": env_primary or "gpt-4o-mini",
+        "fallback": env_fallback or env_primary or "gpt-4o-mini",
+        "temperature": routing_config.get("temperature", 0.7),
+        "max_tokens": routing_config.get("max_tokens", 4096),
+        "reasoning": routing_config.get("reasoning", False),
     }
-    return MODEL_ROUTING.get(agent_name, default_config)
+
+    result = MODEL_ROUTING.get(agent_name, default_config)
+
+    # 关键修复：如果用户在 .env 中配置了 LLM_MODEL，强制覆盖路由表中的模型名
+    if env_primary:
+        result["primary"] = env_primary
+    if env_fallback:
+        result["fallback"] = env_fallback
+    elif env_primary:
+        result["fallback"] = env_primary
+
+    return result
 
 
 # ============================================================
@@ -540,7 +576,7 @@ DEMO_POLISHED_CONTENT = '''第一章 寒江剑鸣
 
 山道上空无一人。唯见晨雾在松林间流淌，几只不知名的鸟儿惊惶掠过树梢。
 
-然而那感觉未曾消退，反而愈发清晰，似有无形的线从某处牵动着他的注意。
+然而那感觉未曾消退，反而愈发清晰，似有无形的线从某处牵动他的注意。
 
 沈炼的目光，落在山道旁一块青石上。
 

@@ -4,6 +4,7 @@ from .outline_agent import OutlineAgent
 from .writer_agent import WriterAgent
 from .checker_agent import CheckerAgent
 from .polisher_agent import PolisherAgent
+from .summarizer_agent import ChapterSummarizerAgent
 
 __all__ = [
     "WorldBuilderAgent",
@@ -11,4 +12,5 @@ __all__ = [
     "WriterAgent",
     "CheckerAgent",
     "PolisherAgent",
+    "ChapterSummarizerAgent",
 ]

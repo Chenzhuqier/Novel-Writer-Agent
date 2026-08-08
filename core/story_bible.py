@@ -379,7 +379,8 @@ class VersionedStoryBible(StoryBible):
     """
 
     # 默认配置
-    MAX_VERSIONS = 100          # 最大保留版本数
+    MAX_VERSIONS = 100          # 最大保留版本数（内存）
+    PERSIST_MAX_VERSIONS = 10   # 落盘持久化的版本数（全量快照，限制文件体积）
     MAX_CONTEXT_CHARS = 8000     # 上下文最大字符数
     DEFAULT_RECENT_SUMMARIES = 3  # 默认获取最近几章摘要
     DEFAULT_MAX_CHARACTERS = 8   # 默认最大展示角色数
@@ -412,7 +413,8 @@ class VersionedStoryBible(StoryBible):
         version = StoryBibleVersion(
             version_id=self._version_counter,
             reason=reason,
-            data=self.to_dict(),
+            # 快照使用基础 dict（不含版本历史），避免快照递归嵌套
+            data=StoryBible.to_dict(self),
         )
         self._versions.append(version)
         self._version_counter += 1
@@ -490,6 +492,7 @@ class VersionedStoryBible(StoryBible):
         chapter_outline: str = "",
         character_names: list[str] = None,
         max_chars: int = None,
+        index=None,
     ) -> str:
         """
         为指定章节组装写作上下文（增强版）
@@ -498,12 +501,15 @@ class VersionedStoryBible(StoryBible):
         - 支持 max_chars 截断
         - 智能优先级排序
         - Token 预估
+        - v0.3：传入可选 SemanticIndex 时，“待回收伏笔”“前情提要”改用语义召回，
+          并输出“语义相关设定”段；无索引/未启用时行为与旧版完全一致。
 
         Args:
             chapter_num: 当前章节号
             chapter_outline: 本章大纲文本
             character_names: 指定的角色名列表
             max_chars: 最大字符限制（None 使用默认值）
+            index: 可选的 SemanticIndex（禁用或为 None 时走原有逻辑）
 
         Returns:
             组装好的上下文字符串
@@ -511,6 +517,8 @@ class VersionedStoryBible(StoryBible):
         max_chars = max_chars or self.MAX_CONTEXT_CHARS
         parts = []
         ch_key = f"ch{chapter_num}"
+        use_vector = index is not None and getattr(index, "enabled", False)
+        search_query = (chapter_outline or "")[:400]
 
         # === 1. 基本信息 ===
         parts.append("=== 故事设定 ===")
@@ -539,14 +547,31 @@ class VersionedStoryBible(StoryBible):
         unresolved = self.get_foreshadowings_planted_before(ch_key)
         if unresolved:
             parts.append("\n=== 待回收伏笔 ===")
-            for fs in unresolved[:5]:  # 最多显示 5 条
+            shown_fs = unresolved[:5] if not use_vector else self._pick_foreshadowings(
+                unresolved, index, search_query, 5,
+            )
+            for fs in shown_fs:
                 parts.append(f"- [{fs.planted_in}] {fs.content} (提示:{fs.hint or '无'})")
+
+        # === 3.5 语义相关设定（可选：角色/地点/道具补充召回）===
+        shown_related = []
+        if use_vector and search_query:
+            related_hits = index.search(search_query, top_k=6)
+            shown_related = self._pick_semantic_settings(related_hits)
+            if shown_related:
+                parts.append("\n=== 语义相关设定 ===")
+                parts.extend(shown_related)
 
         # === 4. 最近章节摘要 ===
         recent = self.get_recent_summaries(self.DEFAULT_RECENT_SUMMARIES)
         if recent:
             parts.append("\n=== 前情提要 ===")
-            for s in recent:
+            shown_sums = recent
+            if use_vector:
+                shown_sums = self._pick_summaries(recent, index, search_query, 3)
+                if not shown_sums:
+                    shown_sums = recent[:3]
+            for s in shown_sums:
                 parts.append(f"第{s.chapter_num}章 {s.title}: {s.summary}")
 
         # === 5. 时间线（最近事件）===
@@ -571,6 +596,54 @@ class VersionedStoryBible(StoryBible):
             full_context = self._compress_context(full_context, max_chars, chapter_num)
 
         return full_context
+
+    # ============================================================
+    # 语义召回辅助（仅在 index.enabled 时被调用，否则上层走原逻辑）
+    # ============================================================
+
+    def _pick_foreshadowings(self, unresolved, index, query: str, top_k: int) -> list:
+        """按语义相关度从未回收伏笔中挑选 top_k 条。"""
+        hits = index.search(query, top_k=max(top_k * 3, 10), prefix="fs:")
+        id_map = {f"fs:{fs.id}": fs for fs in unresolved}
+        picked = []
+        for h in hits:
+            fs = id_map.get(h["doc_id"])
+            if fs and fs not in picked:
+                picked.append(fs)
+            if len(picked) >= top_k:
+                break
+        return picked or unresolved[:top_k]
+
+    def _pick_summaries(self, recent, index, query: str, top_k: int) -> list:
+        """按语义相关度从最近摘要中挑选 top_k 条。"""
+        hits = index.search(query, top_k=max(top_k * 2, 6))
+        picked = []
+        for h in hits:
+            doc_id = h.get("doc_id", "")
+            if not doc_id.startswith("sum:"):
+                continue
+            num = doc_id.split(":", 1)[1]
+            for s in recent:
+                if s.chapter_num == int(num) and s not in picked:
+                    picked.append(s)
+                    break
+            if len(picked) >= top_k:
+                break
+        return picked
+
+    def _pick_semantic_settings(self, related_hits: list, max_blocks: int = 3) -> list:
+        """从语义命中里挑选角色/地点/道具/世界观的补充设定文本。"""
+        blocks = []
+        for h in related_hits:
+            doc_id = h.get("doc_id", "")
+            if not doc_id.startswith(("char:", "loc:", "item:", "world:")):
+                continue
+            text = h.get("text", "")
+            if text and text not in blocks:
+                blocks.append(text)
+            if len(blocks) >= max_blocks:
+                break
+        return blocks
 
     def _compress_context(self, context: str, max_chars: int, chapter_num: int) -> str:
         """
@@ -602,6 +675,7 @@ class VersionedStoryBible(StoryBible):
             "故事设定",
             "角色信息",
             "待回收伏笔",
+            "语义相关设定",
             "前情提要",
             "近期时间线",
             "世界观补充",
@@ -692,16 +766,46 @@ class VersionedStoryBible(StoryBible):
     # ============================================================
 
     def to_dict(self) -> dict:
-        data = {"meta": self.meta}
-        data["characters"] = {k: asdict(v) for k, v in self.characters.items()}
-        data["locations"] = {k: asdict(v) for k, v in self.locations.items()}
-        data["items"] = {k: asdict(v) for k, v in self.items.items()}
-        data["foreshadowings"] = {k: asdict(v) for k, v in self.foreshadowings.items()}
-        data["timeline"] = [asdict(t) for t in self.timeline]
-        data["chapter_summaries"] = {k: asdict(v) for k, v in self.chapter_summaries.items()}
-        data["world_notes"] = self.world_notes
-        data["style_guide"] = self.style_guide
+        data = super().to_dict()
+        data["version_counter"] = self._version_counter
+        data["versions"] = [
+            {
+                "version_id": v.version_id,
+                "timestamp": v.timestamp,
+                "reason": v.reason,
+                "hash": v.hash,
+                "data": v.data,
+            }
+            for v in self._versions[-self.PERSIST_MAX_VERSIONS:]
+        ]
         return data
+
+    def _from_dict(self, data: dict):
+        """从字典恢复状态（含版本历史；兼容无 versions 字段的旧格式）"""
+        super()._from_dict(data)
+
+        self._versions = []
+        for vd in data.get("versions", []):
+            ver = StoryBibleVersion(
+                version_id=vd.get("version_id", 0),
+                reason=vd.get("reason", ""),
+                data=vd.get("data", {}),
+            )
+            ver.timestamp = vd.get("timestamp", ver.timestamp)
+            ver.hash = vd.get("hash", ver.hash)
+            self._versions.append(ver)
+
+        if not self._versions:
+            # 旧格式数据：以当前状态补一条“恢复初始版本”，保证可回滚
+            legacy = StoryBibleVersion(
+                version_id=0,
+                reason="恢复初始版本",
+                data=StoryBible.to_dict(self),
+            )
+            self._versions.append(legacy)
+
+        counter = data.get("version_counter", len(self._versions))
+        self._version_counter = max(int(counter), len(self._versions))
 
     def to_json(self, filepath: str):
         with open(filepath, "w", encoding="utf-8") as f:

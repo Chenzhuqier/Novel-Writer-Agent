@@ -56,6 +56,10 @@
                         <label>章节数量</label>
                         <input type="number" id="chapter-count" value="10" min="3" max="100">
                     </div>
+                    <div class="form-group">
+                        <label>分卷数量</label>
+                        <input type="number" id="volume-count" value="1" min="1" max="10">
+                    </div>
                     <button id="btn-outline" onclick="generateOutline()" disabled>📐 生成大纲</button>
                     <button id="btn-confirm-outline" onclick="confirmStep('outline')" style="display:none;" class="btn-confirm">✅ 确认大纲</button>
                 </section>
