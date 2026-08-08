@@ -5,6 +5,9 @@
 1. 版本控制（checkpoint/rollback）
 2. 上下文压缩器（解决长篇 context 爆炸问题）
 3. 更完善的数据校验
+
+v0.2 修复：
+- ✅ 补全缺失的 StoryBible 基类（原 VersionedStoryBible 继承了不存在的类）
 """
 
 import json
@@ -121,6 +124,234 @@ class ChapterSummary:
     character_state_changes: dict = field(default_factory=dict)
     new_foreshadowing: list = field(default_factory=list)
     resolved_foreshadowing: list = field(default_factory=list)
+
+
+# ============================================================
+# 基础故事圣经类（v0.2 修复：补全缺失的基类）
+# ============================================================
+
+class StoryBible:
+    """
+    故事圣经基础类 —— 管理小说的所有设定和状态数据
+
+    这是 VersionedStoryBible 的基类，提供核心的数据存储和检索功能。
+    所有实体（角色、地点、道具、伏笔等）都通过此类管理。
+    """
+
+    def __init__(self, title: str = "", genre: str = "", premise: str = ""):
+        # 元信息
+        self.meta = {
+            "title": title,
+            "genre": genre,
+            "premise": premise,
+            "created_at": datetime.now().isoformat(),
+        }
+
+        # 世界观备注和文风指南
+        self.world_notes: str = ""
+        self.style_guide: str = ""
+
+        # 实体存储（使用字典以支持按 ID 检索）
+        self.characters: dict[str, Character] = {}
+        self.locations: dict[str, Location] = {}
+        self.items: dict[str, Item] = {}
+        self.foreshadowings: dict[str, Foreshadowing] = {}
+
+        # 时间线和章节摘要
+        self.timeline: list[TimelineEvent] = []
+        self.chapter_summaries: dict[int, ChapterSummary] = {}
+
+    # ============================================================
+    # 角色管理
+    # ============================================================
+
+    def add_character(self, **kwargs) -> Character:
+        """添加角色"""
+        char = Character(**kwargs)
+        self.characters[char.id] = char
+        return char
+
+    def get_character(self, name: str) -> Optional[Character]:
+        """按名称查找角色（模糊匹配）"""
+        for char in self.characters.values():
+            if char.name == name or name in char.alias:
+                return char
+        return None
+
+    def get_active_characters(self) -> list[Character]:
+        """获取所有存活的角色"""
+        return [c for c in self.characters.values() if c.status == "alive"]
+
+    def update_character_status(self, name: str, status: str):
+        """更新角色状态"""
+        char = self.get_character(name)
+        if char:
+            char.status = status
+
+    # ============================================================
+    # 地点管理
+    # ============================================================
+
+    def add_location(self, **kwargs) -> Location:
+        """添加地点"""
+        loc = Location(**kwargs)
+        self.locations[loc.id] = loc
+        return loc
+
+    def get_location(self, name: str) -> Optional[Location]:
+        """按名称查找地点"""
+        for loc in self.locations.values():
+            if loc.name == name:
+                return loc
+        return None
+
+    # ============================================================
+    # 道具管理
+    # ============================================================
+
+    def add_item(self, **kwargs) -> Item:
+        """添加道具"""
+        item = Item(**kwargs)
+        self.items[item.id] = item
+        return item
+
+    # ============================================================
+    # 伏笔管理
+    # ============================================================
+
+    def add_foreshadowing(self, **kwargs) -> Foreshadowing:
+        """添加伏笔"""
+        fs = Foreshadowing(**kwargs)
+        self.foreshadowings[fs.id] = fs
+        return fs
+
+    def resolve_foreshadowing(self, foreshadowing_id: str, resolved_in: str):
+        """回收伏笔"""
+        if foreshadowing_id in self.foreshadowings:
+            fs = self.foreshadowings[foreshadowing_id]
+            fs.resolved = True
+            fs.resolved_in = resolved_in
+
+    def get_unresolved_foreshadowings(self) -> list[Foreshadowing]:
+        """获取所有未回收的伏笔"""
+        return [fs for fs in self.foreshadowings.values() if not fs.resolved]
+
+    def get_foreshadowings_planted_before(self, chapter_key: str) -> list[Foreshadowing]:
+        """获取在指定章节之前埋设的未回收伏笔"""
+        unresolved = self.get_unresolved_foreshadowings()
+        # 简单实现：返回所有未回收伏笔（实际可根据 planted_in 过滤）
+        return unresolved
+
+    # ============================================================
+    # 时间线管理
+    # ============================================================
+
+    def add_timeline_event(self, chapter: str, event: str,
+                           characters_involved: list = None, story_day: int = None):
+        """添加时间线事件"""
+        evt = TimelineEvent(
+            chapter=chapter,
+            event=event,
+            characters_involved=characters_involved or [],
+            story_day=story_day,
+        )
+        self.timeline.append(evt)
+
+    # ============================================================
+    # 章节摘要管理
+    # ============================================================
+
+    def add_chapter_summary(self, summary: ChapterSummary):
+        """添加章节摘要"""
+        self.chapter_summaries[summary.chapter_num] = summary
+
+    def get_recent_summaries(self, count: int = 3) -> list[ChapterSummary]:
+        """获取最近的章节摘要"""
+        sorted_chapters = sorted(self.chapter_summaries.keys())
+        recent_nums = sorted_chapters[-count:] if len(sorted_chapters) >= count else sorted_chapters
+        return [self.chapter_summaries[n] for n in recent_nums]
+
+    # ============================================================
+    # 序列化
+    # ============================================================
+
+    def to_dict(self) -> dict:
+        """导出为字典"""
+        data = {"meta": self.meta}
+        data["characters"] = {k: asdict(v) for k, v in self.characters.items()}
+        data["locations"] = {k: asdict(v) for k, v in self.locations.items()}
+        data["items"] = {k: asdict(v) for k, v in self.items.items()}
+        data["foreshadowings"] = {k: asdict(v) for k, v in self.foreshadowings.items()}
+        data["timeline"] = [asdict(t) for t in self.timeline]
+        data["chapter_summaries"] = {k: asdict(v) for k, v in self.chapter_summaries.items()}
+        data["world_notes"] = self.world_notes
+        data["style_guide"] = self.style_guide
+        return data
+
+    def to_json(self, filepath: str):
+        """导出为 JSON 文件"""
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def from_json(cls, filepath: str) -> "StoryBible":
+        """从 JSON 文件导入"""
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        sb = cls(
+            title=data["meta"].get("title", ""),
+            genre=data["meta"].get("genre", ""),
+            premise=data["meta"].get("premise", ""),
+        )
+        sb.meta = data["meta"]
+        sb.world_notes = data.get("world_notes", "")
+        sb.style_guide = data.get("style_guide", "")
+        sb._from_dict(data)
+        return sb
+
+    def _from_dict(self, data: dict):
+        """从字典恢复状态"""
+        self.meta = data.get("meta", {})
+        self.world_notes = data.get("world_notes", "")
+        self.style_guide = data.get("style_guide", "")
+
+        # 还原各实体
+        self.characters.clear()
+        for cid, cd in data.get("characters", {}).items():
+            self.characters[cid] = Character(**cd)
+
+        self.locations.clear()
+        for lid, ld in data.get("locations", {}).items():
+            self.locations[lid] = Location(**ld)
+
+        self.items.clear()
+        for iid, id_ in data.get("items", {}).items():
+            self.items[iid] = Item(**id_)
+
+        self.foreshadowings.clear()
+        for fid, fd in data.get("foreshadowings", {}).items():
+            self.foreshadowings[fid] = Foreshadowing(**fd)
+
+        self.timeline.clear()
+        for td in data.get("timeline", []):
+            self.timeline.append(TimelineEvent(**td))
+
+        self.chapter_summaries.clear()
+        for num, sd in data.get("chapter_summaries", {}).items():
+            self.chapter_summaries[int(num)] = ChapterSummary(**sd)
+
+    def _touch(self):
+        """标记修改（子类可重写）"""
+        pass
+
+    def __repr__(self):
+        active = len(self.get_active_characters())
+        return (
+            f"<StoryBible '{self.meta['title']}' | "
+            f"{len(self.characters)}角色({active}活跃) | "
+            f"{len(self.foreshadowings)}伏笔({len(self.get_unresolved_foreshadowings())}未收) | "
+            f"{len(self.chapter_summaries)}章已写>"
+        )
 
 
 # ============================================================
@@ -248,37 +479,6 @@ class VersionedStoryBible(StoryBible):
             }
             for v in reversed(recent)
         ]
-
-    def _from_dict(self, data: dict):
-        """从字典恢复状态"""
-        self.meta = data.get("meta", {})
-        self.world_notes = data.get("world_notes", "")
-        self.style_guide = data.get("style_guide", "")
-
-        # 还原各实体
-        self.characters.clear()
-        for cid, cd in data.get("characters", {}).items():
-            self.characters[cid] = Character(**cd)
-
-        self.locations.clear()
-        for lid, ld in data.get("locations", {}).items():
-            self.locations[lid] = Location(**ld)
-
-        self.items.clear()
-        for iid, id_ in data.get("items", {}).items():
-            self.items[iid] = Item(**id_)
-
-        self.foreshadowings.clear()
-        for fid, fd in data.get("foreshadowings", {}).items():
-            self.foreshadowings[fid] = Foreshadowing(**fd)
-
-        self.timeline.clear()
-        for td in data.get("timeline", []):
-            self.timeline.append(TimelineEvent(**td))
-
-        self.chapter_summaries.clear()
-        for num, sd in data.get("chapter_summaries", {}).items():
-            self.chapter_summaries[int(num)] = ChapterSummary(**sd)
 
     # ============================================================
     # 增强的上下文组装（解决长篇 context 爆炸）
@@ -439,10 +639,22 @@ class VersionedStoryBible(StoryBible):
     def _truncate_section(self, name: str, content: str, max_len: int) -> str:
         """根据section类型采用不同的裁剪策略"""
         if name == "角色信息":
-            # 只保留第一个角色的完整信息，其余简化
+            # 按字符预算保留尽量多的角色（行长度差异很大，不能按行数裁剪）
             lines = content.split("\n")
-            if len(lines) > max_len // 10:
-                return f"\n=== {name} ===\n" + "\n".join(lines[:max_len // 10]) + "\n... (更多角色已省略)"
+            header = f"\n=== {name} ===\n"
+            budget = max_len - len(header) - len("... (更多角色已省略)")
+            if budget <= 0:
+                return header
+            kept = []
+            used = 0
+            for line in lines:
+                if used + len(line) + 1 > budget:
+                    break
+                kept.append(line)
+                used += len(line) + 1
+            if len(kept) < len(lines):
+                return header + "\n".join(kept) + "\n... (更多角色已省略)"
+            return header + "\n".join(kept)
         elif name == "近期时间线":
             # 只保留最后3条
             lines = content.strip().split("\n")
@@ -517,11 +729,3 @@ class VersionedStoryBible(StoryBible):
             f"{len(self.chapter_summaries)}章已写 | "
             f"v{self.current_version}>"
         )
-
-
-# ============================================================
-# 保持向后兼容的别名
-# ============================================================
-
-# 让 StoryBible 指向增强版（保持 API 兼容）
-StoryBible = VersionedStoryBible

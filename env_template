@@ -1,0 +1,84 @@
+# ============================================================
+# Novel-Writer-Agent LLM 配置文件
+# ============================================================
+# 复制此文件为 .env 后，根据你的服务商填写下方配置
+# 项目启动时会自动加载此文件（通过 python-dotenv）
+#
+# 📌 使用方法：
+#   1. 取消你需要的服务商配置的注释
+#   2. 填入你的 API Key
+#   3. 保存后运行 python app.py
+# ============================================================
+
+# ----------------------------------------------------------
+# 必填：API Key（三选一填入即可）
+# ----------------------------------------------------------
+
+OPENAI_API_KEY=sk-your-key-here
+
+
+# ----------------------------------------------------------
+# 可选：API 地址和模型配置
+# ----------------------------------------------------------
+
+# API 地址（默认 OpenAI 官方）
+# OPENAI_BASE_URL=https://api.openai.com/v1
+
+# 主力模型（默认 gpt-4o-mini）
+# LLM_MODEL=gpt-4o-mini
+
+# 备用模型（主力模型失败时自动切换）
+# LLM_FALLBACK_MODEL=gpt-4o-mini
+
+
+# ============================================================
+# 🔽 常用服务商配置模板（取消注释即可使用）
+# ============================================================
+
+# --- OpenAI 官方 ---
+# OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxx
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# LLM_MODEL=gpt-4o-mini
+# LLM_FALLBACK_MODEL=gpt-4o
+
+# --- DeepSeek（推荐：性价比高，中文能力强）---
+# OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
+# OPENAI_BASE_URL=https://api.deepseek.com/v1
+# LLM_MODEL=deepseek-chat
+# LLM_FALLBACK_MODEL=deepseek-reasoner
+
+# --- 阿里通义千问 ---
+# OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
+# OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+# LLM_MODEL=qwen-plus
+# LLM_FALLBACK_MODEL=qwen-max
+
+# --- 硅基流动 SiliconFlow ---
+# OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
+# OPENAI_BASE_URL=https://api.siliconflow.cn/v1
+# LLM_MODEL=Qwen/Qwen2.5-72B-Instruct
+# LLM_FALLBACK_MODEL=deepseek-ai/DeepSeek-V3
+
+# --- 智谱 GLM ---
+# OPENAI_API_KEY=xxxxxxxxxxxxxxxx
+# OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+# LLM_MODEL=glm-4-flash
+# LLM_FALLBACK_MODEL=glm-4
+
+# --- 本地 Ollama（无需 API Key）---
+# OPENAI_API_KEY=ollama
+# OPENAI_BASE_URL=http://localhost:11434/v1
+# LLM_MODEL=qwen2.5:72b
+# LLM_FALLBACK_MODEL=llama3.1:70b
+
+# --- Moonshot (Kimi) ---
+# OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
+# OPENAI_BASE_URL=https://api.moonshot.cn/v1
+# LLM_MODEL=moonshot-v1-8k
+# LLM_FALLBACK_MODEL=moonshot-v1-32k
+
+# --- 百度文心一言 ---
+# OPENAI_API_KEY=xxxxxxxxxxxxxxxx
+# OPENAI_BASE_URL=https://qianfan.baidubce.com/v2
+# LLM_MODEL=ernie-speed-128k
+# LLM_FALLBACK_MODEL=ernie-4.0-8k-latest
