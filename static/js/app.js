@@ -170,15 +170,117 @@ function loadChapter(num) {
         content = ch.polished || '(暂无润色稿，请先完成润色)';
       } else if (view === 'check') {
         content = ch.check_report
-          ? JSON.stringify(ch.check_report, null, 2)
+          ? formatReport(ch.check_report)
           : '(暂无检查报告)';
+      } else if (view === 'review') {
+        content = ch.review_report
+          ? formatReviewReport(ch.review_report)
+          : '(暂无审查报告，可点击「审查本章」触发)';
+      } else if (view === 'precheck') {
+        content = ch.precheck
+          ? formatPrecheckReport(ch.precheck)
+          : '(暂无预检报告，可点击「预检本章」触发)';
       } else {
         content = ch.draft || '(暂无初稿)';
       }
-      $('#chapter-meta').textContent = `${meta.word_count || 0} 字 · 重写 ${meta.retry_count || 0} 次`;
-      $('#chapter-output').innerHTML = formatNovelText(content);
+      const extra = [];
+      if (meta.has_review) extra.push('已审查');
+      if (meta.has_precheck) extra.push('已预检');
+      $('#chapter-meta').textContent =
+        `${meta.word_count || 0} 字 · 重写 ${meta.retry_count || 0} 次` +
+        (extra.length ? ` · ${extra.join('/')}` : '');
+      if (view === 'draft' || view === 'polished') {
+        $('#chapter-output').innerHTML = formatNovelText(content);
+      } else {
+        $('#chapter-output').innerHTML = content;
+      }
     })
     .catch((err) => addLog(`❌ 读取章节失败：${err.message}`, 'error'));
+}
+
+function formatReport(report) {
+  return `<div class="report-block">${JSON.stringify(report, null, 2)}</div>`;
+}
+
+function formatReviewReport(report) {
+  if (!report || !report.verdict) return '(报告为空)';
+  const findings = (report.findings || [])
+    .map(
+      (f) =>
+        `<li><b>[${f.severity}]</b> ${esc(f.issue)}<br>` +
+        `<span class="report-loc">${esc(f.location)} · ${esc(f.category)}</span>` +
+        (f.evidence ? `<br><span class="report-ev">证据：${esc(f.evidence)}</span>` : '') +
+        (f.fix ? `<br><span class="report-fix">建议：${esc(f.fix)}</span>` : '') +
+        `</li>`
+    )
+    .join('');
+  return (
+    `<div class="report-block">` +
+    `<h4>verdict: <b>${esc(report.verdict)}</b> · findings ${report.findings.length} 条</h4>` +
+    `<div class="report-meta">Rubric Source: ${esc(report.rubric_source || 'unknown')}</div>` +
+    `<p>${esc(report.summary || '')}</p>` +
+    `<ul>${findings}</ul></div>`
+  );
+}
+
+function formatPrecheckReport(report) {
+  if (!report) return '(报告为空)';
+  const findings = (report.findings || [])
+    .map(
+      (f) =>
+        `<li><b>[${f.severity}]</b> ${esc(f.issue)}` +
+        (f.location ? ` <span class="report-loc">@${esc(f.location)}</span>` : '') +
+        (f.evidence ? `<br><span class="report-ev">原文：${esc(f.evidence)}</span>` : '') +
+        `</li>`
+    )
+    .join('');
+  return (
+    `<div class="report-block">` +
+    `<h4>node 预检：${report.ok ? '已运行' : '未运行'}` +
+    (report.scripts_run && report.scripts_run.length ? ` · ${esc(report.scripts_run.join(', '))}` : '') +
+    ` · ${report.findings.length} 条发现</h4>` +
+    (report.reason ? `<div class="report-meta">${esc(report.reason)}</div>` : '') +
+    (findings ? `<ul>${findings}</ul>` : `<p class="report-ok">✓ 未发现机械问题</p>`) +
+    `</div>`
+  );
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function runReview(num) {
+  if (!num) return;
+  addLog(`🔎 开始对第 ${num} 章做多视角审查...`);
+  fetch(`/api/review/${num}`, { method: 'POST' })
+    .then((r) => r.json())
+    .then((data) => {
+      if (data.error) throw new Error(data.error);
+      addLog(`✅ 第 ${num} 章审查完成：${data.review_report.verdict}`);
+      AppState.chapterMeta[num] = AppState.chapterMeta[num] || {};
+      AppState.chapterMeta[num].has_review = true;
+      AppState.chapterView = 'review';
+      loadChapter(num);
+    })
+    .catch((err) => addLog(`❌ 审查失败：${err.message}`, 'error'));
+}
+
+function runPrecheck(num) {
+  if (!num) return;
+  addLog(`🔬 开始对第 ${num} 章做 node 预检...`);
+  fetch(`/api/precheck/${num}`, { method: 'POST' })
+    .then((r) => r.json())
+    .then((data) => {
+      if (data.error) throw new Error(data.error);
+      addLog(`✅ 第 ${num} 章预检完成：${data.precheck.findings.length} 条发现`);
+      AppState.chapterMeta[num] = AppState.chapterMeta[num] || {};
+      AppState.chapterMeta[num].has_precheck = true;
+      AppState.chapterView = 'precheck';
+      loadChapter(num);
+    })
+    .catch((err) => addLog(`❌ 预检失败：${err.message}`, 'error'));
 }
 
 function toggleChapterView(view) {
@@ -188,6 +290,150 @@ function toggleChapterView(view) {
   });
   const sel = $('#chapter-select');
   if (sel && sel.value) loadChapter(sel.value);
+}
+
+// ============================================================
+// 短篇小说模式
+// ============================================================
+
+let ShortView = 'draft';
+
+function shortArchitect() {
+  const premise = ($('#short-premise') || {}).value || '';
+  if (!premise.trim()) { addLog('⚠️ 请先输入短篇创意', 'warning'); return; }
+  const body = {
+    premise,
+    emotion: ($('#short-emotion') || {}).value || '',
+    genre: ($('#short-genre') || {}).value || '',
+    target_words: parseInt(($('#short-words') || {}).value || 8000, 10),
+    platform: ($('#short-platform') || {}).value || '',
+  };
+  addLog('📐 开始构思短篇框架...');
+  fetch('/api/short/architect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+    .then((r) => r.json())
+    .then((data) => {
+      if (data.error) throw new Error(data.error);
+      addLog(`✅ 框架生成：${data.framework.title}（${data.framework.emotion_goal}）`, 'success');
+      ShortView = 'framework';
+      renderShort();
+    })
+    .catch((err) => addLog(`❌ 构思失败：${err.message}`, 'error'));
+}
+
+function shortWrite() {
+  addLog('✍️ 开始成文...');
+  fetch('/api/short/write', { method: 'POST' })
+    .then((r) => r.json())
+    .then((data) => {
+      if (data.error) throw new Error(data.error);
+      addLog(`✅ 成文完成：${data.word_count} 字`, 'success');
+      ShortView = 'draft';
+      renderShort();
+    })
+    .catch((err) => addLog(`❌ 成文失败：${err.message}`, 'error'));
+}
+
+function shortPolish() {
+  addLog('✨ 开始去AI味润色...');
+  fetch('/api/short/polish', { method: 'POST' })
+    .then((r) => r.json())
+    .then((data) => {
+      if (data.error) throw new Error(data.error);
+      addLog(`✅ 润色完成：${data.word_count} 字`, 'success');
+      ShortView = 'polished';
+      renderShort();
+    })
+    .catch((err) => addLog(`❌ 润色失败：${err.message}`, 'error'));
+}
+
+function shortReview() {
+  addLog('🔎 开始多视角审查...');
+  fetch('/api/short/review', { method: 'POST' })
+    .then((r) => r.json())
+    .then((data) => {
+      if (data.error) throw new Error(data.error);
+      addLog(`✅ 审查完成：${data.review_report.verdict}`, 'success');
+      ShortView = 'review';
+      renderShort();
+    })
+    .catch((err) => addLog(`❌ 审查失败：${err.message}`, 'error'));
+}
+
+function shortPrecheck() {
+  addLog('🔬 开始 node 预检...');
+  fetch('/api/short/precheck', { method: 'POST' })
+    .then((r) => r.json())
+    .then((data) => {
+      if (data.error) throw new Error(data.error);
+      addLog(`✅ 预检完成：${data.precheck.findings.length} 条发现`, 'success');
+      ShortView = 'precheck';
+      renderShort();
+    })
+    .catch((err) => addLog(`❌ 预检失败：${err.message}`, 'error'));
+}
+
+function shortView(view) {
+  ShortView = view;
+  document.querySelectorAll('#short-tab .toggle-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.getAttribute('onclick').includes(`'${view}'`));
+  });
+  renderShort();
+}
+
+function renderShort() {
+  const out = $('#short-output');
+  if (!out) return;
+  fetch('/api/short/status')
+    .then((r) => r.json())
+    .then((d) => {
+      const meta = $('#short-meta');
+      if (meta) {
+        meta.textContent = `${d.framework ? d.framework.title || '未命名' : '暂无框架'}` +
+          (d.draft_word_count ? ` · 初稿 ${d.draft_word_count} 字` : '') +
+          (d.polished_word_count ? ` · 润色稿 ${d.polished_word_count} 字` : '') +
+          (d.emotion ? ` · 情绪：${d.emotion}` : '');
+      }
+      if (ShortView === 'framework') {
+        out.innerHTML = d.framework ? formatReviewReport2(d.framework) : '(暂无框架)';
+      } else if (ShortView === 'draft') {
+        out.innerHTML = d.draft ? formatNovelText(d.draft) : '(暂无初稿，请先成文)';
+      } else if (ShortView === 'polished') {
+        out.innerHTML = d.polished ? formatNovelText(d.polished) : '(暂无润色稿，请先润色)';
+      } else if (ShortView === 'review') {
+        out.innerHTML = d.review_report && d.review_report.verdict
+          ? formatReviewReport(d.review_report) : '(暂无审查报告)';
+      } else if (ShortView === 'precheck') {
+        out.innerHTML = d.precheck ? formatPrecheckReport(d.precheck) : '(暂无预检报告)';
+      }
+    })
+    .catch((err) => addLog(`❌ 读取短篇状态失败：${err.message}`, 'error'));
+}
+
+function formatReviewReport2(fw) {
+  const rev = fw.core_reversal || {};
+  const chars = (fw.characters || []).map((c) =>
+    `<li>${esc(c.role || '')}：${esc(c.name || '')} —— ${esc(c.one_line || '')}</li>`).join('');
+  const sections = (fw.sections || []).map((s) =>
+    `<li>${esc(s.stage || '')}：${esc(s.content || '')}` +
+    (s.hook ? ` <span class="report-loc">钩子：${esc(s.hook)}</span>` : '') + `</li>`).join('');
+  const fs = (rev.foreshadowing || []).map((f) => `<li>${esc(f)}</li>`).join('');
+  return (
+    `<div class="report-block">` +
+    `<h4>${esc(fw.title || '未命名')} · ${esc(fw.emotion_goal || '')} · ${esc(fw.genre || '')}</h4>` +
+    `<p><b>梗概：</b>${esc(fw.logline || '')}</p>` +
+    `<div class="report-meta">字数 ${esc(fw.target_words)} · 平台 ${esc(fw.platform || '自动')}</div>` +
+    `<p><b>核心反转（${esc(rev.type || '?')}）：</b>${esc(rev.content || '')}</p>` +
+    (fs ? `<b>铺垫线索：</b><ul>${fs}</ul>` : '') +
+    `<b>情绪曲线：</b><div class="report-meta">${esc((fw.emotional_curve && fw.emotional_curve.opening) || '')} → ${esc((fw.emotional_curve && fw.emotional_curve.middle) || '')} → ${esc((fw.emotional_curve && fw.emotional_curve.reversal) || '')} → ${esc((fw.emotional_curve && fw.emotional_curve.ending) || '')}</div>` +
+    (chars ? `<b>人物：</b><ul>${chars}</ul>` : '') +
+    (sections ? `<b>五段结构：</b><ul>${sections}</ul>` : '') +
+    (fw.style_notes ? `<div class="report-meta">文风：${esc(fw.style_notes)}</div>` : '') +
+    `</div>`
+  );
 }
 
 // ============================================================

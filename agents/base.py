@@ -194,6 +194,21 @@ MODEL_ROUTING = {
         "max_tokens": 1024,
         "reasoning": False,
     },
+    # 短篇写作：需要高创造性与较长输出
+    "ShortStory": {
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
+        "temperature": 0.85,
+        "max_tokens": 8192,
+        "reasoning": False,
+    },
+    "ShortStoryWriter": {
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
+        "temperature": 0.85,
+        "max_tokens": 8192,
+        "reasoning": False,
+    },
 }
 
 

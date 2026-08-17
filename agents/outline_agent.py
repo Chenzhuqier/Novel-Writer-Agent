@@ -15,6 +15,7 @@
 import json
 
 from .base import BaseAgent, register_demo, DEMO_CHAPTER_OUTLINE
+from core.skill_knowledge import outline_rules
 
 register_demo("OutlineArchitect", DEMO_CHAPTER_OUTLINE, estimated_tokens=2000)
 
@@ -40,7 +41,12 @@ class OutlineAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return """你是一位资深的网文/小说架构师，擅长将世界观设定转化为可执行的写作蓝图。
+        rules, _ = outline_rules()
+        skill_block = ""
+        if rules:
+            skill_block = "\n\n# 网文大纲架构要点（skill 知识注入）\n" + rules
+        return ("你是一位资深的网文/小说架构师，擅长将世界观设定转化为可执行的写作蓝图。"
+                + skill_block + """
 
 ## 你的思考步骤（请按以下顺序思考，但只输出最终 JSON）
 
@@ -110,7 +116,7 @@ class OutlineAgent(BaseAgent):
 - [ ] 整体节奏有起伏（不是一条直线）？
 - [ ] total_volumes / estimated_total_chapters / 各卷 chapter_count / 实际章数是否一致？
 
-请根据给定的世界观设定，按照上述格式输出完整的大纲 JSON。只输出 JSON，不要任何其他文字。"""
+请根据给定的世界观设定，按照上述格式输出完整的大纲 JSON。只输出 JSON，不要任何其他文字。""")
 
     # ================= 主入口 =================
 

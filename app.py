@@ -35,6 +35,17 @@ except ImportError:
 from core.story_bible import VersionedStoryBible, ChapterSummary
 from core.state import StoryStateTracker
 from core.vector_index import SemanticIndex
+from core.skill_knowledge import (
+    polisher_rules,
+    reviewer_rules,
+    platform_rubric,
+    writer_rules,
+    outline_rules,
+    genre_style_rules,
+    resolve_skills_dir,
+    is_available,
+)
+from core.skill_precheck import run_precheck
 from agents import (
     WorldBuilderAgent,
     OutlineAgent,
@@ -42,6 +53,8 @@ from agents import (
     CheckerAgent,
     PolisherAgent,
     ChapterSummarizerAgent,
+    ReviewerAgent,
+    ShortStoryAgent,
 )
 from agents.base import tracker as token_tracker
 from agents.checker_agent import QUALITY_FLOOR
@@ -102,6 +115,18 @@ class NovelProject:
             "total_retries": 0,
             "failed_chapters": [],
         }
+        # skill 集成开关（默认开启；node 缺失时预检自动跳过）
+        self.skills_enabled = True
+        self.review_enabled = True
+        self.precheck_enabled = True
+        # 短篇小说模式（独立于长篇流水线）
+        self.short_story = {
+            "framework": None,
+            "draft": "",
+            "polished": "",
+            "review_report": {},
+            "precheck": {},
+        }
 
     # ============================================================
     # v0.2 修复 #4：数据持久化与恢复
@@ -143,6 +168,10 @@ class NovelProject:
                 # 保存跨章状态追踪器
                 with open(os.path.join(self.DATA_DIR, "state.json"), "w", encoding="utf-8") as f:
                     json.dump(self.state_tracker.to_dict(), f, ensure_ascii=False, indent=2)
+
+                # 保存短篇小说模式状态
+                with open(os.path.join(self.DATA_DIR, "short_story.json"), "w", encoding="utf-8") as f:
+                    json.dump(self.short_story, f, ensure_ascii=False, indent=2)
 
             except Exception as e:
                 print(f"[警告] 保存状态失败: {e}")
@@ -197,6 +226,12 @@ class NovelProject:
                     with open(state_path, "r", encoding="utf-8") as f:
                         self.state_tracker = StoryStateTracker.from_dict(json.load(f))
                 self.state_tracker.index = self.vector_index
+
+                # 恢复短篇小说模式状态
+                short_path = os.path.join(self.DATA_DIR, "short_story.json")
+                if os.path.exists(short_path):
+                    with open(short_path, "r", encoding="utf-8") as f:
+                        self.short_story = json.load(f)
 
                 # 从恢复的故事圣经重建语义索引（幂等）
                 self.sync_vector_index()
@@ -462,11 +497,17 @@ def _execute_write_chapter_with_retry(chapter_num: int = None, **kwargs):
         quality_score=check_result.get("overall_quality_score") if check_result else None,
         protected_terms=_collect_protected_terms(),
         strict=True,
+        deslop=True,
+        deslop_rules=_load_polisher_rules(),
     )
 
     with project._lock:
         project.chapters[chapter_num]["polished"] = polished
     _log(f"💎 第 {chapter_num} 章润色完成")
+
+    # skill 集成：多视角审查 + 确定性预检（仅记录，不阻塞流水线）
+    _run_chapter_review(chapter_num, polished, checker_inputs)
+    _run_chapter_precheck(chapter_num, polished)
 
     # 提取摘要并更新故事圣经
     _extract_and_update_summary(chapter_num, draft)
@@ -596,6 +637,215 @@ def _collect_protected_terms() -> list:
     return [t for t in dict.fromkeys(terms) if t]
 
 
+def _load_polisher_rules() -> str:
+    """加载去AI味规则（skill 知识，缺失回退内置摘要）"""
+    text, _ = polisher_rules()
+    return text
+
+
+def _detect_platform() -> str:
+    """按书名/题材粗判目标平台，供审查 rubric 选择。"""
+    with project._lock:
+        genre = (project.genre or "").strip()
+        title = (project.bible.meta.get("title") or "").strip()
+    blob = f"{genre} {title}".lower()
+    if any(k in blob for k in ("番茄", "追读", "短篇", "盐言", "知乎")):
+        return "zhihu" if ("知乎" in blob or "盐言" in blob or "短篇" in blob) else "fanqie"
+    if any(k in blob for k in ("起点", "玄幻", "修仙", "仙侠", "都市", "连载")):
+        return "qidian"
+    return "generic"
+
+
+def _run_chapter_review(chapter_num: int, text: str, checker_inputs: dict) -> dict:
+    """对成稿跑多视角审查（story-review），结果存 chapters[num]["review_report"]。
+
+    只记录不阻塞：verdict 非 APPROVE 仅影响报告展示，不改变 MAX_RETRIES 流程。
+    """
+    if not project.skills_enabled or not project.review_enabled:
+        return {}
+
+    try:
+        reviewer = ReviewerAgent(temperature=0.3)
+        rubric_text, rubric_src = _build_review_rubric()
+        report = reviewer.run(
+            chapter_text=text,
+            chapter_num=chapter_num,
+            rubric=rubric_text,
+            rubric_source=rubric_src,
+            character_states=checker_inputs.get("character_states"),
+            open_foreshadowing=checker_inputs.get("open_foreshadowing"),
+            prev_chapter_digest=checker_inputs.get("prev_chapter_digest"),
+        )
+        report["rubric_source"] = rubric_src
+        with project._lock:
+            project.chapters.setdefault(chapter_num, {})["review_report"] = report
+        _log(f"🔎 第 {chapter_num} 章多视角审查完成：{report.get('verdict', '?')}"
+             f"（{len(report.get('findings', []))} 条 findings）")
+        return report
+    except Exception as e:
+        _log(f"⚠️ 第 {chapter_num} 章多视角审查失败：{e}")
+        return {}
+
+
+def _build_review_rubric() -> tuple[str, str]:
+    """组装审查基准包：(rubric 文本, 来源标注)。"""
+    platform = _detect_platform()
+    if platform == "generic":
+        text, source = reviewer_rules()
+    else:
+        platform_text, p_source = platform_rubric(platform)
+        core_text, core_source = reviewer_rules()
+        text = f"{platform_text}\n\n{core_text}"
+        source = "file" if (p_source == "file" or core_source == "file") else (
+            "embedded fallback" if (p_source == "embedded" or core_source == "embedded")
+            else "missing"
+        )
+    return text, source
+
+
+def _run_chapter_precheck(chapter_num: int, text: str) -> dict:
+    """对成稿跑 node 确定性预检（story-review scripts），结果存 chapters[num]["precheck"]。"""
+    if not project.skills_enabled or not project.precheck_enabled:
+        return {}
+
+    try:
+        result = run_precheck(text)
+        with project._lock:
+            project.chapters.setdefault(chapter_num, {})["precheck"] = result
+        if result.get("findings"):
+            _log(f"🔬 第 {chapter_num} 章预检发现 {len(result['findings'])} 条机械问题")
+        else:
+            _log(f"🔬 第 {chapter_num} 章预检通过（{', '.join(result.get('scripts_run', [])) or '无脚本'}）")
+        return result
+    except Exception as e:
+        _log(f"⚠️ 第 {chapter_num} 章预检失败：{e}")
+        return {}
+
+
+# ============================================================
+# 短篇小说模式（story-short-write 集成）
+# ============================================================
+
+def _short_run_framework(premise: str, emotion: str, genre: str,
+                         target_words: int, platform: str) -> dict:
+    """构思短篇框架并存入 project.short_story。"""
+    with project._lock:
+        ss = project.short_story
+        ss["premise"] = premise
+        ss["emotion"] = emotion
+        ss["genre"] = genre
+        ss["target_words"] = target_words
+        ss["platform"] = platform
+
+    agent = ShortStoryAgent(temperature=0.85)
+    framework = agent.run_framework(
+        premise=premise, emotion=emotion, genre=genre,
+        target_words=target_words, platform=platform,
+    )
+    if not isinstance(framework, dict) or framework.get("parse_error"):
+        raise ValueError("短篇框架解析失败，请重试")
+    with project._lock:
+        project.short_story["framework"] = framework
+        project.short_story["draft"] = ""
+        project.short_story["polished"] = ""
+        project.short_story["review_report"] = {}
+        project.short_story["precheck"] = {}
+    _log(f"📐 短篇框架生成：{framework.get('title', '未命名')}"
+         f" | 反转：{framework.get('core_reversal', {}).get('type', '?')}")
+    return framework
+
+
+def _short_run_write() -> str:
+    """按框架成文并存入 project.short_story。"""
+    with project._lock:
+        framework = project.short_story.get("framework")
+    if not framework:
+        raise ValueError("请先构思短篇框架")
+    agent = ShortStoryAgent(temperature=0.85)
+    draft = agent.run_write(framework)
+    with project._lock:
+        project.short_story["draft"] = draft
+    _log(f"✍️ 短篇成文完成：{len(draft)} 字")
+    return draft
+
+
+def _short_run_polish() -> str:
+    """去AI味润色短篇正文（复用 PolisherAgent 的 deslop 能力）。"""
+    with project._lock:
+        draft = project.short_story.get("draft", "")
+    if not draft:
+        raise ValueError("请先成文")
+    polisher = PolisherAgent()
+    polished = polisher.run(
+        text=draft,
+        deslop=True,
+        deslop_rules=_load_polisher_rules(),
+        strict=False,
+    )
+    with project._lock:
+        project.short_story["polished"] = polished
+    _log(f"✨ 短篇润色完成：{len(polished)} 字")
+    return polished
+
+
+def _short_run_review() -> dict:
+    """对短篇跑多视角审查（复用 ReviewerAgent + 短篇题材风格包 rubric）。"""
+    if not project.skills_enabled or not project.review_enabled:
+        return {}
+    with project._lock:
+        text = project.short_story.get("polished") or project.short_story.get("draft", "")
+        genre = project.short_story.get("genre", "")
+    if not text:
+        raise ValueError("请先成文或润色")
+    reviewer = ReviewerAgent(temperature=0.3)
+    rubric_text, rubric_src = _build_short_review_rubric(genre)
+    report = reviewer.run(
+        chapter_text=text,
+        chapter_num=1,
+        rubric=rubric_text,
+        rubric_source=rubric_src,
+    )
+    report["rubric_source"] = rubric_src
+    with project._lock:
+        project.short_story["review_report"] = report
+    _log(f"🔎 短篇审查完成：{report.get('verdict', '?')}"
+         f"（{len(report.get('findings', []))} 条 findings）")
+    return report
+
+
+def _build_short_review_rubric(genre: str = "") -> tuple[str, str]:
+    """组装短篇审查基准：题材风格包 + 通用审查规则。"""
+    style_text, style_source = genre_style_rules(genre)
+    core_text, core_source = reviewer_rules()
+    if style_text:
+        text = f"{style_text}\n\n{core_text}"
+        source = "file" if (style_source == "file" or core_source == "file") else (
+            "embedded fallback" if (style_source == "embedded" or core_source == "embedded")
+            else "missing"
+        )
+    else:
+        text, source = core_text, core_source
+    return text, source
+
+
+def _short_run_precheck() -> dict:
+    """对短篇跑 node 确定性预检。"""
+    if not project.skills_enabled or not project.precheck_enabled:
+        return {}
+    with project._lock:
+        text = project.short_story.get("polished") or project.short_story.get("draft", "")
+    if not text:
+        raise ValueError("请先成文或润色")
+    result = run_precheck(text)
+    with project._lock:
+        project.short_story["precheck"] = result
+    if result.get("findings"):
+        _log(f"🔬 短篇预检发现 {len(result['findings'])} 条机械问题")
+    else:
+        _log(f"🔬 短篇预检通过（{', '.join(result.get('scripts_run', [])) or '无脚本'}）")
+    return result
+
+
 def _build_bible_summary_for_check() -> str:
     """为检查 Agent 构建简化的故事圣经摘要"""
     parts = []
@@ -687,7 +937,14 @@ def _extract_and_update_summary(chapter_num: int, text: str):
     summarizer = ChapterSummarizerAgent(temperature=0.3)
 
     try:
-        summary_data = summarizer.run(chapter_text=text, chapter_num=chapter_num)
+        # 大纲标题优先（续写占位细纲的标题是通用「第N章」，交给正则从正文提取）
+        outline = _get_chapter_outline(chapter_num)
+        outline_title = None
+        if outline and outline.get("summary_type") != "续写扩展章":
+            outline_title = outline.get("title") or None
+        summary_data = summarizer.run(
+            chapter_text=text, chapter_num=chapter_num, title=outline_title
+        )
         if not isinstance(summary_data, dict) or summary_data.get("parse_error"):
             raise ValueError("摘要解析失败")
         summary = ChapterSummary(**summary_data)
@@ -783,6 +1040,176 @@ def api_write_chapter(chapter_num):
     )
     thread.start()
     return jsonify({"status": "started"})
+
+
+@app.route("/api/review/<int:chapter_num>", methods=["POST"])
+def api_review_chapter(chapter_num):
+    """对已写作章节做多视角审查（story-review），同步返回报告。"""
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    with project._lock:
+        chapter = project.chapters.get(chapter_num)
+    if not chapter:
+        return jsonify({"error": f"第 {chapter_num} 章不存在，请先写作"}), 404
+
+    text = chapter.get("polished") or chapter.get("draft") or ""
+    if not text:
+        return jsonify({"error": "章节正文为空"}), 400
+
+    _seed_tracker_characters()
+    checker_inputs = project.state_tracker.build_checker_inputs()
+    report = _run_chapter_review(chapter_num, text, checker_inputs)
+    if not report:
+        return jsonify({"error": "审查未执行（skill 已关闭或发生异常）"}), 400
+    project.save_state()
+    return jsonify({"chapter": chapter_num, "review_report": report})
+
+
+@app.route("/api/precheck/<int:chapter_num>", methods=["POST"])
+def api_precheck_chapter(chapter_num):
+    """对已写作章节做 node 确定性预检（story-review scripts）。"""
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    with project._lock:
+        chapter = project.chapters.get(chapter_num)
+    if not chapter:
+        return jsonify({"error": f"第 {chapter_num} 章不存在，请先写作"}), 404
+
+    text = chapter.get("polished") or chapter.get("draft") or ""
+    if not text:
+        return jsonify({"error": "章节正文为空"}), 400
+
+    result = _run_chapter_precheck(chapter_num, text)
+    project.save_state()
+    return jsonify({"chapter": chapter_num, "precheck": result})
+
+
+# ============================================================
+# 短篇小说模式 API
+# ============================================================
+
+@app.route("/api/short/architect", methods=["POST"])
+def api_short_architect():
+    """构思短篇框架"""
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    data = request.get_json(silent=True) or {}
+    premise = (data.get("premise") or "").strip()
+    if not premise:
+        return jsonify({"error": "请提供短篇创意（premise）"}), 400
+
+    try:
+        framework = _short_run_framework(
+            premise=premise,
+            emotion=(data.get("emotion") or "").strip(),
+            genre=(data.get("genre") or "").strip(),
+            target_words=int(data.get("target_words") or 8000),
+            platform=(data.get("platform") or "").strip(),
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _log(f"❌ 短篇构思失败：{e}")
+        return jsonify({"error": f"短篇构思失败：{e}"}), 500
+
+    project.save_state()
+    return jsonify({"framework": framework})
+
+
+@app.route("/api/short/write", methods=["POST"])
+def api_short_write():
+    """按框架成文"""
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    try:
+        draft = _short_run_write()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _log(f"❌ 短篇成文失败：{e}")
+        return jsonify({"error": f"短篇成文失败：{e}"}), 500
+
+    project.save_state()
+    return jsonify({"draft": draft, "word_count": len(draft)})
+
+
+@app.route("/api/short/polish", methods=["POST"])
+def api_short_polish():
+    """去AI味润色短篇"""
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    try:
+        polished = _short_run_polish()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _log(f"❌ 短篇润色失败：{e}")
+        return jsonify({"error": f"短篇润色失败：{e}"}), 500
+
+    project.save_state()
+    return jsonify({"polished": polished, "word_count": len(polished)})
+
+
+@app.route("/api/short/review", methods=["POST"])
+def api_short_review():
+    """对短篇跑多视角审查"""
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    try:
+        report = _short_run_review()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _log(f"❌ 短篇审查失败：{e}")
+        return jsonify({"error": f"短篇审查失败：{e}"}), 500
+
+    project.save_state()
+    return jsonify({"review_report": report})
+
+
+@app.route("/api/short/precheck", methods=["POST"])
+def api_short_precheck():
+    """对短篇跑 node 确定性预检"""
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    try:
+        result = _short_run_precheck()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _log(f"❌ 短篇预检失败：{e}")
+        return jsonify({"error": f"短篇预检失败：{e}"}), 500
+
+    project.save_state()
+    return jsonify({"precheck": result})
+
+
+@app.route("/api/short/status", methods=["GET"])
+def api_short_status():
+    """获取短篇小说模式当前状态"""
+    with project._lock:
+        ss = project.short_story
+        return jsonify({
+            "framework": ss.get("framework"),
+            "draft": ss.get("draft", ""),
+            "draft_word_count": len(ss.get("draft", "")),
+            "polished": ss.get("polished", ""),
+            "polished_word_count": len(ss.get("polished", "")),
+            "review_report": ss.get("review_report", {}),
+            "precheck": ss.get("precheck", {}),
+            "premise": ss.get("premise", ""),
+            "emotion": ss.get("emotion", ""),
+            "genre": ss.get("genre", ""),
+            "target_words": ss.get("target_words", 8000),
+            "platform": ss.get("platform", ""),
+        })
 
 
 @app.route("/api/write-all", methods=["POST"])
@@ -1271,8 +1698,18 @@ def api_status():
                     "word_count": len(ch.get("polished") or ch.get("draft") or ""),
                     "has_polished": bool(ch.get("polished")),
                     "retry_count": ch.get("retry_count", 0),
+                    "has_review": bool(ch.get("review_report")),
+                    "has_precheck": bool(ch.get("precheck")),
                 }
                 for num, ch in project.chapters.items()
+            },
+            # skill 集成状态
+            "skills": {
+                "enabled": project.skills_enabled,
+                "review_enabled": project.review_enabled,
+                "precheck_enabled": project.precheck_enabled,
+                "skills_dir_available": is_available("story-review"),
+                "skills_dir": str(resolve_skills_dir()),
             },
         })
 

@@ -736,6 +736,496 @@ class TestPolisherAgentV03:
         print("✅ Demo 润色行为正常")
 
 
+class TestSummarizerAgentV05:
+    """
+    v0.5 验证：摘要 Agent Pydantic schema 校验 + 分块合并管线 + 解析重试 + 防御式兜底
+    - 后端：ChapterSummarySchema 强校验、超长正文分块合并、解析失败回喂重试
+    - 流水线：app.py 传入大纲标题；冻结 Demo 注册行保持原样
+    """
+
+    def test_backend_markers(self):
+        """summarizer_agent.py 应包含 schema、分块合并、重试与兜底标记"""
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "agents", "summarizer_agent.py")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "ChapterSummarySchema" in content, "缺少 Pydantic schema"
+        assert "field_validator" in content, "缺少字段校验器"
+        assert "_chunk_text" in content, "缺少分块函数"
+        assert "_merge_partials" in content, "缺少字段级合并"
+        assert "_TITLE_RE" in content, "缺少标题正则"
+        assert "_prepare_text" in content, "缺少绝对上限保护"
+        assert "max_parse_retries" in content, "缺少解析重试参数"
+        assert "_DEFAULT_MAX_TEXT_CHARS" in content, "缺少分块阈值常量"
+        print("✅ 摘要 Agent v0.5 机制已接入")
+
+    def test_frozen_demo_registration_preserved(self):
+        """冻结约定：ChapterSummarizer 的 Demo 注册行必须保持原样"""
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "agents", "summarizer_agent.py")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert 'register_demo("ChapterSummarizer", DEMO_SUMMARY, estimated_tokens=800)' in content, \
+            "ChapterSummarizer Demo 注册行被改动"
+        print("✅ 摘要 Agent Demo 注册保持冻结")
+
+    def test_pipeline_wiring(self):
+        """app.py 摘要提取应传入大纲标题（占位细纲除外）"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert 'outline.get("summary_type") != "续写扩展章"' in content, "缺少占位细纲标题过滤"
+        assert "title=outline_title" in content, "未传入大纲标题"
+        print("✅ 流水线摘要标题接线完成")
+
+    def test_title_regex(self):
+        """首行标题正则提取正常"""
+        from agents.summarizer_agent import ChapterSummarizerAgent as A
+        assert A._extract_title_from_text("第一章 寒江剑鸣\n\n正文……") == "寒江剑鸣"
+        assert A._extract_title_from_text("第3章 重逢\n\n正文……") == "重逢"
+        assert A._extract_title_from_text("Chapter 3 重逢\n\n正文……") == "重逢"
+        assert A._extract_title_from_text("正文直接开始……") == ""
+        print("✅ 标题正则提取正常")
+
+    def test_chunking(self):
+        """分块切分：每块非空且不超过 chunk_chars"""
+        from agents.summarizer_agent import ChapterSummarizerAgent as A, _DEFAULT_CHUNK_CHARS
+        paras = "\n\n".join("第%d段" % i * 200 for i in range(40))
+        chunks = A._chunk_text(paras, _DEFAULT_CHUNK_CHARS)
+        assert chunks, "分块结果为空"
+        assert all(0 < len(c) <= _DEFAULT_CHUNK_CHARS for c in chunks), "存在超长或空块"
+        print("✅ 分块切分正常")
+
+    def test_safe_parse_garbage(self):
+        """垃圾输入兜底：不抛异常、章号被强制、带 parse_error 标记"""
+        from agents.summarizer_agent import ChapterSummarizerAgent as A
+        r = A()._safe_parse("这不是 JSON{{{{{", 3)
+        assert isinstance(r, dict), "垃圾输入兜底应返回 dict"
+        assert r["chapter_num"] == 3, "章号应被强制为 3"
+        assert r.get("parse_error") is True, "应标记解析失败"
+        print("✅ 垃圾输入兜底不崩溃")
+
+    def test_safe_parse_partial_field_coercion(self):
+        """字段类型强转兜底：类型错误字段可塞多少塞多少"""
+        from agents.summarizer_agent import ChapterSummarizerAgent as A
+        r = A()._safe_parse('{"chapter_num": 7, "title": "X", "summary": 12345}', 2)
+        assert r["chapter_num"] == 2, "章号应被强制为 2"
+        assert r["summary"] == "12345", "summary 应被强转为字符串"
+        assert isinstance(r["key_events"], list), "key_events 应为列表"
+        print("✅ 字段类型强转兜底正常")
+
+    def test_demo_run_behavior(self):
+        """Demo 模式单次摘要：字段齐全、章号强制、标题回填"""
+        from agents.summarizer_agent import ChapterSummarizerAgent as A
+        backup = os.environ.get("OPENAI_API_KEY")
+        if backup is not None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            r = A().run(chapter_text="第一章 寒江剑鸣\n\n正文内容……", chapter_num=1)
+            assert r["chapter_num"] == 1, "章号应被强制为 1"
+            assert r.get("title") == "寒江剑鸣", "标题应从正文提取"
+            assert isinstance(r.get("characters_present"), list)
+            assert isinstance(r.get("key_events"), list)
+        finally:
+            if backup is not None:
+                os.environ["OPENAI_API_KEY"] = backup
+        print("✅ Demo 单次摘要正常")
+
+    def test_demo_long_text_chunking(self):
+        """Demo 模式超长正文分块合并：不崩、章号强制、字段可用"""
+        from agents.summarizer_agent import ChapterSummarizerAgent as A
+        backup = os.environ.get("OPENAI_API_KEY")
+        if backup is not None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            long_text = "第一章 寒江剑鸣\n\n" + "\n\n".join(
+                "这是第%d段正文内容……" % i * 20 for i in range(200)
+            )
+            r = A().run(chapter_text=long_text, chapter_num=5)
+            assert r["chapter_num"] == 5, "章号应被强制为 5"
+            assert r.get("summary") or r.get("key_events"), "合并结果不应为空"
+            assert isinstance(r.get("key_events"), list)
+        finally:
+            if backup is not None:
+                os.environ["OPENAI_API_KEY"] = backup
+        print("✅ Demo 分块合并管线正常")
+
+
+class TestSkillKnowledge:
+    """
+    Phase 0 验证：skill 知识加载器 —— 运行时读全局 skill 目录 + 内嵌降级
+    """
+
+    def test_resolve_skills_dir(self):
+        """目录解析：默认 ~/.agents/skills，可用 SKILLS_DIR 覆盖"""
+        from core.skill_knowledge import resolve_skills_dir
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["SKILLS_DIR"] = tmp
+            try:
+                assert str(resolve_skills_dir()) == tmp
+            finally:
+                os.environ.pop("SKILLS_DIR", None)
+        print("✅ 目录解析正常")
+
+    def test_load_reference_file(self):
+        """本机有 skill 目录时应读到真实文件内容"""
+        from core.skill_knowledge import load_reference
+        text = load_reference("story-deslop", "anti-ai-writing.md")
+        if text is not None:
+            assert "去AI" in text or "AI 味" in text or "禁用" in text
+        print("✅ 真实文件读取正常（缺失时跳过）")
+
+    def test_get_knowledge_embedded_fallback(self):
+        """不存在的引用应回退内嵌摘录并标注 embedded"""
+        from core.skill_knowledge import get_knowledge
+        text, source = get_knowledge("story-review", "quality-rubric.md")
+        assert text, "不应返回空文本"
+        assert source in ("file", "embedded")
+        print("✅ 内嵌降级正常")
+
+    def test_polisher_rules_loader(self):
+        """polisher_rules 组装非空"""
+        from core.skill_knowledge import polisher_rules
+        text, source = polisher_rules()
+        assert text and source in ("file", "embedded")
+        print("✅ polisher 规则加载正常")
+
+    def test_reviewer_rules_loader(self):
+        """reviewer_rules 组装非空"""
+        from core.skill_knowledge import reviewer_rules, platform_rubric
+        text, source = reviewer_rules()
+        assert text and source in ("file", "embedded")
+        p, ps = platform_rubric("fanqie")
+        assert p and ps in ("file", "embedded")
+        print("✅ reviewer/平台规则加载正常")
+
+
+class TestPolisherSkillDeslop:
+    """
+    Phase 1 验证：Polisher 去AI味增强 —— deslop 参数注入与默认兜底
+    """
+
+    def test_run_accepts_deslop_params(self):
+        """run/run_detailed 接受 deslop 与 deslop_rules 参数"""
+        from agents.polisher_agent import PolisherAgent
+        backup = os.environ.get("OPENAI_API_KEY")
+        if backup is not None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            result = PolisherAgent().run_detailed(
+                text='沈炼握紧寒江剑，低声说道："耐得住寂寞，方能成大器。"他转身下山。',
+                quality_score=6.5,
+                protected_terms=["沈炼", "寒江剑"],
+                strict=False,
+                deslop=True,
+                deslop_rules='## 去AI味\n1. 禁止"不是A，而是B"句式。',
+            )
+            assert result.content, "润色正文为空"
+        finally:
+            if backup is not None:
+                os.environ["OPENAI_API_KEY"] = backup
+        print("✅ deslop 参数生效")
+
+    def test_build_user_msg_injects_deslop(self):
+        """deslop 开启时 user_msg 含去AI味区块，关闭时不含"""
+        from agents.polisher_agent import PolisherAgent
+        agent = PolisherAgent()
+        msg_on = agent._build_user_msg(
+            text="x", style_guide="", quality_score=None,
+            strategy=("微调", "x"), protected_terms=[],
+            deslop=True, deslop_rules="自定义去AI味规则",
+        )
+        assert "去AI味" in msg_on and "自定义去AI味规则" in msg_on
+        msg_off = agent._build_user_msg(
+            text="x", style_guide="", quality_score=None,
+            strategy=("微调", "x"), protected_terms=[],
+            deslop=False, deslop_rules="",
+        )
+        assert "去AI味" not in msg_off
+        print("✅ 去AI味区块注入/关闭正常")
+
+    def test_app_wiring(self):
+        """app.py 润色调用应传入 deslop 与 deslop_rules"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "deslop=True" in content
+        assert "deslop_rules=_load_polisher_rules()" in content
+        assert "def _load_polisher_rules" in content
+        print("✅ 流水线去AI味接线完成")
+
+
+class TestReviewerAgentV01:
+    """
+    Phase 2 验证：多视角审查 Agent —— schema 校验 + S1-S4 定级 + demo 直通
+    """
+
+    def test_backend_markers(self):
+        """reviewer_agent.py 应包含 schema/视角/自修复/对账标记"""
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "agents", "reviewer_agent.py")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "ReviewReport" in content and "ReviewFinding" in content
+        assert 'register_demo("StoryReviewer"' in content
+        assert "MAX_REPAIR_ATTEMPTS" in content
+        assert "_finalize" in content and "verdict" in content
+        print("✅ 审查 Agent 机制已接入")
+
+    def test_agents_export(self):
+        """ReviewerAgent 应被导出"""
+        from agents import ReviewerAgent
+        assert ReviewerAgent is not None
+        print("✅ ReviewerAgent 导出正常")
+
+    def test_demo_run_behavior(self):
+        """Demo 模式审查：verdict/S1-S4 findings/对账不崩"""
+        from agents.reviewer_agent import ReviewerAgent
+        from core.skill_knowledge import reviewer_rules
+        backup = os.environ.get("OPENAI_API_KEY")
+        if backup is not None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            rubric, source = reviewer_rules()
+            r = ReviewerAgent().run(
+                chapter_text='第一章 寒江剑鸣\n\n沈炼握紧寒江剑，转身下山。',
+                chapter_num=1, rubric=rubric, rubric_source=source,
+            )
+            assert r["verdict"] in ("APPROVE", "CONCERNS", "REJECT")
+            assert isinstance(r["findings"], list)
+            for f in r["findings"]:
+                assert f["severity"] in ("S1", "S2", "S3", "S4")
+        finally:
+            if backup is not None:
+                os.environ["OPENAI_API_KEY"] = backup
+        print("✅ Demo 审查行为正常")
+
+    def test_finalize_corrects_verdict(self):
+        """S1 存在时 verdict 应被重算为 REJECT"""
+        from agents.reviewer_agent import ReviewerAgent, ReviewReport, ReviewFinding
+        report = ReviewReport(
+            verdict="APPROVE",
+            findings=[
+                ReviewFinding(
+                    severity="S1", category="consistency",
+                    location="[P1]", evidence="角色已死亡却登场",
+                    issue="死者复活", fix="删除或改为他人",
+                )
+            ],
+                    summary="本段存在严重设定冲突，需要立即修复。",
+        )
+        data = ReviewerAgent._finalize(report)
+        assert data["verdict"] == "REJECT"
+        print("✅ verdict 对账正常")
+
+
+class TestSkillPrecheck:
+    """
+    Phase 4 验证：node 确定性预检 —— 静默降级 + findings 结构
+    """
+
+    def test_returns_dict(self):
+        """返回结构稳定：ok/findings/scripts_run/reason 键齐全"""
+        from core.skill_precheck import run_precheck
+        r = run_precheck("第一章 测试\n\n正文内容……")
+        assert set(("ok", "findings", "scripts_run", "reason")) <= set(r.keys())
+        assert isinstance(r["findings"], list)
+        print("✅ 预检返回结构正常")
+
+    def test_empty_text_safe(self):
+        """空文本直接返回 reason，不抛异常"""
+        from core.skill_precheck import run_precheck
+        r = run_precheck("")
+        assert r["ok"] is False and r["reason"] == "empty text"
+        print("✅ 空文本兜底正常")
+
+    def test_demo_text_finds_issues(self):
+        """含 AI 味的正文应产生 findings（本机有 node 与脚本时）"""
+        from core.skill_precheck import run_precheck
+        text = ('第一章 测试\n\n沈炼眼中闪过一丝悲伤。他深吸一口气，'
+                '心中涌起一股暖流——一切都会好起来的。')
+        r = run_precheck(text)
+        if r["ok"]:
+            assert any("破折号" in f["issue"] or f["category"] == "format"
+                       for f in r["findings"]), "应至少发现破折号/格式问题"
+        print("✅ 预检发现机械问题（脚本可用时）")
+
+
+class TestPipelineSkillIntegration:
+    """
+    Phase 5 验证：流水线接线 —— 新端点、chapters 新字段、skill 配置回显
+    """
+
+    def test_endpoints_exist(self):
+        """app.py 应包含 /api/review 与 /api/precheck 端点"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert '"/api/review/<int:chapter_num>"' in content
+        assert '"/api/precheck/<int:chapter_num>"' in content
+        assert "def _run_chapter_review" in content
+        assert "def _run_chapter_precheck" in content
+        print("✅ 审查/预检端点已接入")
+
+    def test_pipeline_wiring(self):
+        """主流水线润色后应调用审查与预检，chapters 存新字段"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "_run_chapter_review(chapter_num, polished" in content
+        assert "_run_chapter_precheck(chapter_num, polished" in content
+        assert '"review_report"' in content
+        assert '"precheck"' in content
+        print("✅ 流水线 skill 接线完成")
+
+    def test_status_echoes_skills(self):
+        """状态端点回显 skill 配置（skills_dir_available / review_enabled）"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert '"skills_dir_available"' in content
+        assert '"review_enabled"' in content
+        assert '"precheck_enabled"' in content
+        print("✅ 状态端点回显 skill 配置")
+
+    def test_frontend_matches(self):
+        """前端应提供审查/预检按钮与视图切换"""
+        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "templates", "index.html")
+        js_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "static", "js", "app.js")
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        with open(js_path, "r", encoding="utf-8") as f:
+            js = f.read()
+        assert "审查本章" in html and "预检本章" in html
+        assert "toggleChapterView('review')" in html and "toggleChapterView('precheck')" in html
+        assert "formatReviewReport" in js and "formatPrecheckReport" in js
+        assert "runReview" in js and "runPrecheck" in js
+        print("✅ 前端审查/预检视图已接入")
+
+
+class TestShortStoryPipeline:
+    """
+    短篇网文写作流水线（story-short-write 集成）验证
+    """
+
+    def test_agent_exists(self):
+        """ShortStoryAgent 应可导入并导出"""
+        from agents import ShortStoryAgent
+        assert ShortStoryAgent is not None
+        print("✅ ShortStoryAgent 导出正常")
+
+    def test_demo_registered(self):
+        """ShortStory / ShortStoryWriter demo 应已注册（新增冻结项，非改既有）"""
+        from agents.base import DEMO_REGISTRY
+        assert "ShortStory" in DEMO_REGISTRY
+        assert "ShortStoryWriter" in DEMO_REGISTRY
+        print("✅ 短篇 demo 注册完成")
+
+    def test_framework_demo_behavior(self):
+        """Demo 模式构思：返回含核心字段的框架 dict"""
+        from agents.short_story_agent import ShortStoryAgent
+        backup = os.environ.get("OPENAI_API_KEY")
+        if backup is not None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            fw = ShortStoryAgent().run_framework(
+                premise="我爹的剑被仇人夺走三年，今日却在一个病秧子手里见到。",
+                emotion="反转震撼", genre="悬疑", platform="知乎",
+            )
+            assert isinstance(fw, dict) and not fw.get("parse_error")
+            assert fw.get("title") and fw.get("logline")
+            assert fw.get("core_reversal", {}).get("foreshadowing")
+            assert isinstance(fw.get("sections", []), list)
+        finally:
+            if backup is not None:
+                os.environ["OPENAI_API_KEY"] = backup
+        print("✅ 短篇框架 demo 正常")
+
+    def test_write_demo_behavior(self):
+        """Demo 模式成文：返回非空正文"""
+        from agents.short_story_agent import ShortStoryAgent, DEMO_SHORT_FRAMEWORK
+        import json as _json
+        backup = os.environ.get("OPENAI_API_KEY")
+        if backup is not None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            fw = _json.loads(DEMO_SHORT_FRAMEWORK)
+            text = ShortStoryAgent().run_write(fw)
+            assert isinstance(text, str) and len(text) > 500
+        finally:
+            if backup is not None:
+                os.environ["OPENAI_API_KEY"] = backup
+        print("✅ 短篇成文 demo 正常")
+
+    def test_skill_knowledge_loaded(self):
+        """短篇 skill 知识应可加载：题材风格包映射"""
+        from core.skill_knowledge import genre_style_rules, short_story_rules
+        text, source = genre_style_rules("悬疑")
+        assert text and source in ("file", "embedded")
+        rules, rsrc = short_story_rules("悬疑")
+        assert rules and rsrc in ("file", "embedded")
+        print("✅ 短篇 skill 知识加载正常")
+
+    def test_skill_knowledge_embedded_fallback(self):
+        """题材风格包无匹配时应返回空（内嵌兜底由 short_story_rules 承担）"""
+        from core.skill_knowledge import genre_style_rules
+        text, source = genre_style_rules("不存在的题材xyz")
+        assert text == "" and source == "missing"
+        print("✅ 题材风格包缺失兜底正常")
+
+    def test_api_endpoints(self):
+        """app.py 应包含短篇 API 端点与辅助函数"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        for route in ("/api/short/architect", "/api/short/write", "/api/short/polish",
+                      "/api/short/review", "/api/short/precheck", "/api/short/status"):
+            assert route in content
+        for fn in ("_short_run_framework", "_short_run_write", "_short_run_polish",
+                   "_short_run_review", "_short_run_precheck", "_build_short_review_rubric"):
+            assert f"def {fn}" in content
+        print("✅ 短篇 API 端点与辅助函数已接入")
+
+    def test_persistence(self):
+        """短篇状态应随 save_state/load_state 落盘"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert '"short_story.json"' in content
+        assert 'self.short_story' in content
+        print("✅ 短篇状态持久化已接入")
+
+    def test_frontend(self):
+        """前端应提供短篇标签页、输入区与五个操作按钮"""
+        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "templates", "index.html")
+        js_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "static", "js", "app.js")
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        with open(js_path, "r", encoding="utf-8") as f:
+            js = f.read()
+        assert "短篇小说模式" in html
+        assert "shortArchitect()" in html and "shortWrite()" in html and "shortPolish()" in html
+        assert "shortReview()" in html and "shortPrecheck()" in html
+        assert "function shortArchitect" in js and "function shortWrite" in js
+        assert "function renderShort" in js and "function shortView" in js
+        print("✅ 短篇前端已接入")
+
+    def test_models_route(self):
+        """base.py 应包含 ShortStory 与 ShortStoryWriter 路由配置"""
+        base_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "agents", "base.py")
+        with open(base_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert '"ShortStory": {' in content
+        assert '"ShortStoryWriter": {' in content
+        print("✅ 短篇模型路由已接入")
+
+
 # ============================================================
 # 主入口：运行所有测试
 # ============================================================
@@ -757,6 +1247,13 @@ def run_all_tests():
         TestContinuationWrite,
         TestOutlineAgentV03,
         TestPolisherAgentV03,
+        TestSummarizerAgentV05,
+        TestSkillKnowledge,
+        TestPolisherSkillDeslop,
+        TestReviewerAgentV01,
+        TestSkillPrecheck,
+        TestPipelineSkillIntegration,
+        TestShortStoryPipeline,
     ]
 
     total = 0

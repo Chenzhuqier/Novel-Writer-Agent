@@ -285,6 +285,25 @@ button:disabled {
     color: white;
 }
 
+/* 审查 / 预检报告块 */
+.report-block {
+    background: #f1f5f9;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    font-size: 13px;
+    line-height: 1.8;
+    max-height: 500px;
+    overflow-y: auto;
+}
+.report-block h4 { margin: 0 0 6px; }
+.report-block ul { margin: 8px 0 0; padding-left: 18px; }
+.report-block li { margin-bottom: 8px; }
+.report-meta { color: var(--text-secondary); font-size: 12px; margin: 4px 0; }
+.report-loc { color: var(--text-secondary); font-size: 12px; }
+.report-ev, .report-fix { font-size: 12px; color: var(--text-secondary); }
+.report-ok { color: #15803d; }
+
 /* 输出区域 */
 pre {
     background: #f1f5f9;

@@ -29,6 +29,18 @@ _DIALOG_RE = re.compile(r'"([^"\n]{1,300})"')
 # 默认润色温度：要求"保持原意"，低温度更稳；需要更有创造力的改写时可调高
 DEFAULT_TEMPERATURE = 0.4
 
+# 内置去AI味摘要（无 skill 知识注入时的兜底；完整规则由 core.skill_knowledge 提供）
+_DEFAULT_DESLOP_RULES = """1. 改味优先，别当改错：AI 味是风格问题不是语法错误，把过度工整、面面俱到的文字拉回具体、自然、可读。
+2. 改最少效果最大：能改一个词就不改一句，能删一句就不重写一段；人名、地名、数字、专有名词优先保留，不得整段删除正文。
+3. 保留创作意图：只改"怎么说"，不改"说什么"；不新增原文没有的情节、设定、关系或时间线。
+4. 最高优先级禁用句式：①"不是A，而是B"（直接写 B）②"，带着……"万能状语（删状语留主句）③章末总结体（用动作/对话/悬念收束）。
+5. 一级禁用词出现即替换：仿佛、犹如、宛若、一丝、一抹、深吸一口气、眼中闪过、嘴角勾起、心头一震、不容置疑、不由自主、话锋一转。
+6. 弱化副词密度控制：缓缓/微微/轻轻/淡淡 每千字合计 ≤3。
+7. Show Don't Tell：不写"他很紧张/愤怒/伤心"，写身体反应（"手心全是汗，筷子差点掉了"）。
+8. 句长：叙述默认是逗号长句（逗号之间 8-12 字、整句 20-30 字）；短句只作偶尔的孤立重拍，不用碎句/电报体。
+9. 标点：正文（含对话）不用破折号与省略号硬造停顿，用句号、逗号、短句或动作断句。
+10. 对话必须逐字保留（包括语气词和标点）；不得改变动作先后顺序。"""
+
 _SYSTEM_PROMPT = f"""你是一位资深文学编辑，擅长润色小说正文，提升文笔质量的同时保持原意不变。
 
 ## 润色原则
@@ -143,6 +155,8 @@ class PolisherAgent(BaseAgent):
         quality_score=None,
         protected_terms=None,
         strict: bool = False,
+        deslop: bool = True,
+        deslop_rules: str = "",
         **kwargs,
     ) -> str:
         """执行润色，返回润色后的正文（与 v0.2 签名兼容）。
@@ -153,6 +167,8 @@ class PolisherAgent(BaseAgent):
             quality_score: 原文质量评分 0-10（可选），用于匹配差异化策略
             protected_terms: 必须原样保留的专有名词列表（可选）
             strict: 输出校验未通过时是否自动重试一次
+            deslop: 是否注入去AI味规则（默认开启）
+            deslop_rules: 去AI味规则文本（来自 skill 知识，缺省用内置摘要）
         """
         return self.run_detailed(
             text,
@@ -160,6 +176,8 @@ class PolisherAgent(BaseAgent):
             quality_score=quality_score,
             protected_terms=protected_terms,
             strict=strict,
+            deslop=deslop,
+            deslop_rules=deslop_rules,
             **kwargs,
         ).content
 
@@ -170,6 +188,8 @@ class PolisherAgent(BaseAgent):
         quality_score: float = None,
         protected_terms=None,
         strict: bool = False,
+        deslop: bool = True,
+        deslop_rules: str = "",
         **kwargs,
     ) -> PolishResult:
         """执行润色并返回完整结果（含润色说明与校验警告）。"""
@@ -186,7 +206,10 @@ class PolisherAgent(BaseAgent):
             raise ValueError(f"quality_score 应在 0-10 之间，当前为 {quality_score}")
 
         strategy = self._strategy_for(quality_score)
-        user_msg = self._build_user_msg(text, style_guide, quality_score, strategy, protected_terms)
+        user_msg = self._build_user_msg(
+            text, style_guide, quality_score, strategy, protected_terms,
+            deslop=deslop, deslop_rules=deslop_rules,
+        )
 
         print(
             f"[{self.name}] 开始润色：原文 {len(text)} 字，策略「{strategy[0]}」，"
@@ -232,9 +255,15 @@ class PolisherAgent(BaseAgent):
         quality_score: float,
         strategy: tuple,
         protected_terms: list,
+        deslop: bool = True,
+        deslop_rules: str = "",
     ) -> str:
         """分段组装 user prompt，替代脆弱的 += 拼接。"""
         parts = ["请润色以下小说章节。"]
+
+        if deslop:
+            rules = deslop_rules.strip() or _DEFAULT_DESLOP_RULES
+            parts.append(f"## 去AI味要求\n{rules}")
 
         if style_guide and style_guide.strip():
             parts.append(f"## 文风要求\n{style_guide.strip()}")

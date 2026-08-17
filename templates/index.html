@@ -79,6 +79,51 @@
                     </div>
                 </section>
 
+                <!-- 短篇小说模式 -->
+                <section class="card step-card" id="step-short">
+                    <h2>📕 短篇小说模式</h2>
+                    <div class="form-group">
+                        <label>目标情绪</label>
+                        <select id="short-emotion">
+                            <option value="">自动推荐</option>
+                            <option value="意难平">意难平（虐恋/遗憾）</option>
+                            <option value="反转震撼">反转震撼（悬疑/身份错位）</option>
+                            <option value="爽感释放">爽感释放（打脸/逆袭）</option>
+                            <option value="治愈温暖">治愈温暖（成长/亲情）</option>
+                            <option value="细思极恐">细思极恐（悬疑/心理）</option>
+                            <option value="共鸣感动">共鸣感动（现实/婚姻）</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>题材方向</label>
+                        <input type="text" id="short-genre" placeholder="例如：悬疑、追妻火葬场、甜宠、沙雕脑洞...">
+                    </div>
+                    <div class="form-group">
+                        <label>短篇创意</label>
+                        <textarea id="short-premise" rows="3" placeholder="例如：我爹的剑被仇人夺走三年，今日却在一个病秧子手里见到..."></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>目标字数</label>
+                        <input type="number" id="short-words" value="8000" min="1000" max="20000">
+                    </div>
+                    <div class="form-group">
+                        <label>目标平台</label>
+                        <select id="short-platform">
+                            <option value="">自动</option>
+                            <option value="知乎">知乎盐言</option>
+                            <option value="番茄">番茄</option>
+                            <option value="小程序">小程序短剧</option>
+                        </select>
+                    </div>
+                    <div class="write-controls">
+                        <button onclick="shortArchitect()">📐 构思框架</button>
+                        <button onclick="shortWrite()">✍️ 成文</button>
+                        <button onclick="shortPolish()">✨ 去AI味润色</button>
+                        <button onclick="shortReview()">🔎 审查</button>
+                        <button onclick="shortPrecheck()">🔬 预检</button>
+                    </div>
+                </section>
+
                 <!-- 操作按钮组 -->
                 <section class="card action-card">
                     <h2>🛠️ 操作</h2>
@@ -132,6 +177,7 @@
                         <button class="tab-btn" data-tab="outline-tab" onclick="switchTab('outline')">📋 大纲</button>
                         <button class="tab-btn" data-tab="chapter-tab" onclick="switchTab('chapter')">📖 章节</button>
                         <button class="tab-btn" data-tab="bible-tab" onclick="switchTab('bible')">📚 圣经</button>
+                        <button class="tab-btn" data-tab="short-tab" onclick="switchTab('short')">📕 短篇</button>
                     </div>
                     <div id="world-tab" class="tab-content active">
                         <pre id="world-output"></pre>
@@ -145,16 +191,33 @@
                                 <option value="">选择章节...</option>
                             </select>
                             <span id="chapter-meta"></span>
+                            <button class="toggle-btn" onclick="runReview($('#chapter-select').value)">审查本章</button>
+                            <button class="toggle-btn" onclick="runPrecheck($('#chapter-select').value)">预检本章</button>
                         </div>
                         <div class="chapter-view-toggle">
                             <button class="toggle-btn active" onclick="toggleChapterView('draft')">初稿</button>
                             <button class="toggle-btn" onclick="toggleChapterView('polished')">润色稿</button>
                             <button class="toggle-btn" onclick="toggleChapterView('check')">检查报告</button>
+                            <button class="toggle-btn" onclick="toggleChapterView('review')">审查报告</button>
+                            <button class="toggle-btn" onclick="toggleChapterView('precheck')">预检报告</button>
                         </div>
                         <pre id="chapter-output"></pre>
                     </div>
                     <div id="bible-tab" class="tab-content">
                         <pre id="bible-output"></pre>
+                    </div>
+                    <div id="short-tab" class="tab-content">
+                        <div class="chapter-nav">
+                            <span id="short-meta"></span>
+                        </div>
+                        <div class="chapter-view-toggle">
+                            <button class="toggle-btn" onclick="shortView('framework')">框架</button>
+                            <button class="toggle-btn active" onclick="shortView('draft')">初稿</button>
+                            <button class="toggle-btn" onclick="shortView('polished')">润色稿</button>
+                            <button class="toggle-btn" onclick="shortView('review')">审查报告</button>
+                            <button class="toggle-btn" onclick="shortView('precheck')">预检报告</button>
+                        </div>
+                        <div id="short-output" class="report-block" style="max-height:none;">请先在左侧输入创意并点击「构思框架」。</div>
                     </div>
                 </section>
             </div>

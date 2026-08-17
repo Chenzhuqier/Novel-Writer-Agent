@@ -1,5 +1,6 @@
 import json
 from .base import BaseAgent, register_demo, DEMO_NOVEL_CONTENT
+from core.skill_knowledge import writer_rules
 
 # 注意：笔记 + 4000字正文约需 5000-6000 token 输出预算，
 # demo 估价和 max_tokens 都要相应上调，否则长章节会被截断。
@@ -14,7 +15,14 @@ class WriterAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return """你是一位才华横溢的小说家，擅长根据详细大纲与设定写出引人入胜的章节正文。
+        rules, _ = writer_rules()
+        skill_block = ""
+        if rules:
+            skill_block = f"""
+
+# 网文写作要点（skill 知识注入）
+{rules}"""
+        return f"""你是一位才华横溢的小说家，擅长根据详细大纲与设定写出引人入胜的章节正文。{skill_block}
 
 # 输出结构（最高优先级）
 每次输出必须严格分为两段，顺序不可调换：
