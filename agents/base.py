@@ -288,6 +288,11 @@ def call_llm(
     config = get_model_config(agent_name)
     models_to_try = [model or config["primary"], config["fallback"]]
 
+    # 兼容网关要求：json_object 模式要求消息中出现字面 "json"（部分网关大小写敏感），
+    # 否则直接 400 拒绝。prompt 里通常写的是大写 "JSON"，需确保小写关键词存在。
+    if force_json and "json" not in (system_prompt + user_message):
+        user_message += "\n\n请以 json 格式输出（json_object）。"
+
     for attempt in range(max_retries + 1):
         try:
             import openai
