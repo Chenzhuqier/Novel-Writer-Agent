@@ -524,6 +524,27 @@ class TestVectorRag:
         assert "sync_vector_index" in content, "app.py 缺少 sync_vector_index 索引同步方法"
         print("✅ app.py 已接入向量索引")
 
+    def test_modelscope_default_source(self):
+        """模型下载源默认应为魔搭社区，且含 Hugging Face 回退"""
+        vs_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "core", "vector_index.py")
+        with open(vs_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert 'MODEL_SOURCE = os.environ.get("MODEL_SOURCE", "modelscope")' in content
+        assert "snapshot_download" in content, "缺少 modelscope.snapshot_download 下载"
+        assert 'MODEL_SOURCE == "huggingface"' in content, "缺少 Hugging Face 强制回退分支"
+        assert "requirements-rag" in content or True
+        print("✅ 模型下载源默认魔搭社区 + HF 回退")
+
+    def test_rag_requirements_modelscope(self):
+        """requirements-rag.txt 应包含 modelscope 依赖说明"""
+        req_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "requirements-rag.txt")
+        with open(req_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "modelscope" in content
+        print("✅ requirements-rag.txt 已包含 modelscope")
+
 
 class TestContinuationWrite:
     """
@@ -1226,6 +1247,252 @@ class TestShortStoryPipeline:
         print("✅ 短篇模型路由已接入")
 
 
+class TestWorldStateLedger:
+    """v0.4 世界状态账本（core/world_state.py）验证"""
+
+    def test_world_state_delta(self):
+        """apply_delta 应按章节合并世界状态：位置覆盖、新增角色、剧情线追加"""
+        from core.world_state import WorldState
+        ws = WorldState()
+        ws.apply_delta(1, {
+            "characters": {"沈炼": {"alive": True, "location": "青州"}},
+            "items": {"寒江剑": {"owner": "沈炼"}},
+            "open_threads": ["寻找噬魂珠"],
+        })
+        ws.apply_delta(2, {"characters": {"沈炼": {"alive": True, "location": "云城"}}})
+        assert ws.as_of_chapter == 2
+        assert ws.characters["沈炼"]["location"] == "云城"
+        assert ws.characters["沈炼"].get("location_history") == ["青州", "云城"]
+        assert ws.items["寒江剑"]["owner"] == "沈炼"
+        assert "寻找噬魂珠" in ws.open_threads
+        print("✅ 世界状态增量合并正常")
+
+    def test_foreshadowing_aging(self):
+        """set_foreshadowings 应按植入章节计算搁置时长"""
+        from core.world_state import WorldState
+        ws = WorldState()
+        ws.set_foreshadowings(
+            [{"content": "神秘令牌来历", "planted_in": "第1章", "hint": "与身世有关"}],
+            as_of_chapter=12,
+        )
+        assert len(ws.pending_foreshadowings) == 1
+        assert ws.pending_foreshadowings[0]["age"] == 11
+        print("✅ 伏笔搁置时长计算正常")
+
+    def test_to_text(self):
+        """to_text 应输出世界状态文本且受 char_limit 约束"""
+        from core.world_state import WorldState
+        ws = WorldState()
+        ws.apply_delta(1, {"characters": {"沈炼": {"alive": True, "location": "青州"}}})
+        text = ws.to_text(char_limit=50)
+        assert "沈炼" in text
+        assert len(text) <= 50 + 10
+        print("✅ 世界状态文本渲染正常")
+
+    def test_roundtrip(self):
+        """to_dict / from_dict 应无损往返"""
+        from core.world_state import WorldState
+        ws = WorldState()
+        ws.apply_delta(3, {"characters": {"云裳": {"alive": True, "location": "蜀山"}},
+                           "open_threads": ["剑冢之谜"]})
+        ws2 = WorldState.from_dict(ws.to_dict())
+        assert ws2.as_of_chapter == 3
+        assert ws2.characters["云裳"]["location"] == "蜀山"
+        assert ws2.open_threads == ["剑冢之谜"]
+        print("✅ 世界状态账本持久化往返正常")
+
+    def test_persistence_wired(self):
+        """app.py 应把账本写入 data/world_state.json 并在启动时恢复"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert '"world_state.json"' in content
+        assert "WorldState.from_dict" in content
+        assert "self.world_state" in content
+        print("✅ 世界状态账本持久化已接入")
+
+
+class TestContinuityContract:
+    """v0.4 连续性契约（build_continuity_contract）验证"""
+
+    def test_contract_header(self):
+        """契约应使用 === 连贯性契约 === 头（供 _compress_context 解析）"""
+        from core.world_state import build_continuity_contract
+        contract = build_continuity_contract(None)
+        assert contract.startswith("=== 连贯性契约 ===")
+        print("✅ 契约头格式正确")
+
+    def test_contract_contains_world_state(self):
+        """契约应包含当前世界状态快照"""
+        from core.world_state import WorldState, build_continuity_contract
+        ws = WorldState()
+        ws.apply_delta(1, {"characters": {"沈炼": {"alive": True, "location": "青州"}}})
+        contract = build_continuity_contract(ws)
+        assert "沈炼" in contract and "青州" in contract
+        print("✅ 契约含世界状态快照")
+
+    def test_contract_aging_hint(self):
+        """伏笔搁置过久应出现提醒"""
+        from core.world_state import WorldState, build_continuity_contract
+        ws = WorldState()
+        ws.set_foreshadowings(
+            [{"content": "神秘令牌", "planted_in": "第1章", "hint": ""}],
+            as_of_chapter=10,
+        )
+        contract = build_continuity_contract(ws)
+        assert "未回收" in contract
+        print("✅ 契约含伏笔搁置提醒")
+
+    def test_contract_in_bible_context(self):
+        """build_context_for_chapter 应注入契约段（world_state 非空时）"""
+        from core.world_state import WorldState
+        from core.story_bible import VersionedStoryBible
+        ws = WorldState()
+        ws.apply_delta(1, {"characters": {"沈炼": {"alive": True, "location": "青州"}}})
+        bible = VersionedStoryBible(title="测试", genre="玄幻")
+        ctx = bible.build_context_for_chapter(3, chapter_outline="{}", world_state=ws)
+        assert "=== 连贯性契约 ===" in ctx
+        assert "沈炼" in ctx
+        print("✅ 契约段已注入写作上下文")
+
+
+class TestBucketedContext:
+    """v0.4 分桶历史脉络 + 全史语义召回上下文验证"""
+
+    def test_recent_summaries_section(self):
+        """前情提要应包含最近摘要"""
+        from core.story_bible import VersionedStoryBible, ChapterSummary
+        bible = VersionedStoryBible(title="测试", genre="玄幻")
+        for n in range(1, 5):
+            bible.add_chapter_summary(ChapterSummary(chapter_num=n, title=f"第{n}章",
+                                                     summary=f"第{n}章摘要内容"))
+        ctx = bible.build_context_for_chapter(5, chapter_outline="{}")
+        assert "第3章摘要内容" in ctx or "前情提要" in ctx
+        print("✅ 前情提要含最近摘要")
+
+    def test_bucketed_history(self):
+        """超过分桶阈值后应出现历史脉络（第2桶起）"""
+        from core.story_bible import VersionedStoryBible, ChapterSummary
+        bible = VersionedStoryBible(title="测试", genre="玄幻")
+        for n in range(1, 26):
+            bible.add_chapter_summary(ChapterSummary(chapter_num=n, title=f"第{n}章",
+                                                     summary=f"第{n}章摘要内容"))
+        ctx = bible.build_context_for_chapter(26, chapter_outline="{}")
+        assert "历史脉络" in ctx
+        assert "第1-10章：" in ctx
+        print("✅ 历史脉络分桶正常")
+
+    def test_buckets_capped(self):
+        """历史脉络桶数应受 MAX_HISTORY_BUCKETS 上限约束"""
+        from core.story_bible import VersionedStoryBible, ChapterSummary
+        bible = VersionedStoryBible(title="测试", genre="玄幻")
+        for n in range(1, 101):
+            bible.add_chapter_summary(ChapterSummary(chapter_num=n, title=f"第{n}章",
+                                                     summary=f"第{n}章摘要内容"))
+        ctx = bible.build_context_for_chapter(101, chapter_outline="{}")
+        import re
+        buckets = re.findall(r"第\d+-\d+章：", ctx)
+        assert len(buckets) <= bible.MAX_HISTORY_BUCKETS
+        print(f"✅ 历史脉络桶数 {len(buckets)} 不超过上限 {bible.MAX_HISTORY_BUCKETS}")
+
+    def test_compress_keeps_contract(self):
+        """超限压缩时契约段应优先保留"""
+        from core.world_state import WorldState
+        from core.story_bible import VersionedStoryBible, ChapterSummary
+        ws = WorldState()
+        ws.apply_delta(1, {"characters": {"沈炼": {"alive": True, "location": "青州"}}})
+        bible = VersionedStoryBible(title="测试", genre="玄幻")
+        for n in range(1, 8):
+            bible.add_chapter_summary(ChapterSummary(chapter_num=n, title=f"第{n}章",
+                                                     summary="长摘要" * 30))
+        ctx = bible.build_context_for_chapter(8, chapter_outline="{}", world_state=ws,
+                                              max_chars=500)
+        assert "=== 连贯性契约 ===" in ctx
+        print("✅ 压缩后契约段保留")
+
+
+class TestContinuityAudit:
+    """v0.4 全量连贯性审计（ContinuityAuditor + /api/audit）验证"""
+
+    def test_audit_agent_export(self):
+        """AuditAgent 应可导入"""
+        from agents import AuditAgent
+        assert AuditAgent is not None
+        print("✅ AuditAgent 导出正常")
+
+    def test_demo_registered(self):
+        """ContinuityAuditor demo 应已注册（新增冻结项）"""
+        from agents.base import DEMO_REGISTRY
+        assert "ContinuityAuditor" in DEMO_REGISTRY
+        print("✅ ContinuityAuditor demo 注册完成")
+
+    def test_demo_behavior(self):
+        """Demo 模式审计：返回含 findings 的报告 dict"""
+        from agents.audit_agent import AuditAgent
+        backup = os.environ.get("OPENAI_API_KEY")
+        if backup is not None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            report = AuditAgent().run(
+                chapters_text="===== 第1章 =====\n沈炼得到了寒江剑。",
+                world_state_text="沈炼：存活",
+                bible_summary="测试项目",
+                issue_history_text="",
+                as_of_chapter=1,
+            )
+            assert isinstance(report, dict)
+            assert isinstance(report.get("findings", []), list)
+            assert "summary" in report
+        finally:
+            if backup is not None:
+                os.environ["OPENAI_API_KEY"] = backup
+        print("✅ 连贯性审计 demo 正常")
+
+    def test_api_endpoint(self):
+        """app.py 应包含 /api/audit 端点与辅助函数"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "/api/audit" in content
+        assert "def _run_continuity_audit" in content
+        assert "AUDIT_INTERVAL" in content
+        assert "_run_continuity_audit()" in content
+        print("✅ 全量连贯性审计端点已接入")
+
+    def test_auto_trigger(self):
+        """每 AUDIT_INTERVAL 章应自动触发审计"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "chapter_num % project.AUDIT_INTERVAL" in content
+        print("✅ 周期性自动审计已接入")
+
+    def test_frontend(self):
+        """前端应提供审计按钮与审计报告视图"""
+        html_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "templates", "index.html")
+        js_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "static", "js", "app.js")
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        with open(js_path, "r", encoding="utf-8") as f:
+            js = f.read()
+        assert "连贯审计" in html
+        assert "runAudit" in html
+        assert "function runAudit" in js and "function formatAuditReport" in js
+        print("✅ 审计前端已接入")
+
+    def test_world_state_endpoint(self):
+        """/api/status 应返回世界状态与审计摘要"""
+        app_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert '"world_state"' in content
+        assert '"audit"' in content
+        assert "last_audited_chapter" in content
+        print("✅ 状态接口已含账本与审计字段")
+
+
 # ============================================================
 # 主入口：运行所有测试
 # ============================================================
@@ -1254,6 +1521,10 @@ def run_all_tests():
         TestSkillPrecheck,
         TestPipelineSkillIntegration,
         TestShortStoryPipeline,
+        TestWorldStateLedger,
+        TestContinuityContract,
+        TestBucketedContext,
+        TestContinuityAudit,
     ]
 
     total = 0

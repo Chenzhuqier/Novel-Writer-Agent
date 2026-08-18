@@ -1,10 +1,16 @@
 # ============================================================
 # 可选扩展：向量语义检索（RAG）依赖
 # ============================================================
-# 用途：为 build_context_for_chapter / 伏笔台账提供语义召回，
-#       默认关闭（.env 的 ENABLE_VECTOR 未开启时不影响现有流程）。
+# 用途：为 build_context_for_chapter / 伏笔台账提供语义召回。
 # 安装：
 #   pip install -r requirements-rag.txt
 # 首次运行会联网下载中文嵌入模型 BAAI/bge-small-zh-v1.5（约 100MB）。
+#
+# 下载源（默认魔搭社区 ModelScope，国内速度快）：
+#   - 模型从魔搭社区拉取，无需额外配置；缺 modelscope 时自动回退 Hugging Face。
+#   - 如需强制 Hugging Face：.env 里设 MODEL_SOURCE=huggingface
+#   - 可选换模型：.env 里设 VECTOR_MODEL=<model-id>
 
 sentence-transformers>=2.0
+# 模型下载源（魔搭社区，国内网络友好）。仅下载用，不参与推理。
+modelscope>=1.15

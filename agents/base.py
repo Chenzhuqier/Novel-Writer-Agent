@@ -209,6 +209,14 @@ MODEL_ROUTING = {
         "max_tokens": 8192,
         "reasoning": False,
     },
+    # 全量审计：需要严谨与长上下文，低温度、输出较长
+    "ContinuityAuditor": {
+        "primary": os.environ.get("LLM_MODEL", "gpt-4o"),
+        "fallback": os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
+        "temperature": 0.2,
+        "max_tokens": 4096,
+        "reasoning": False,
+    },
 }
 
 

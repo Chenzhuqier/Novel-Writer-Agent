@@ -124,6 +124,7 @@ class ChapterSummary:
     character_state_changes: dict = field(default_factory=dict)
     new_foreshadowing: list = field(default_factory=list)
     resolved_foreshadowing: list = field(default_factory=list)
+    world_state_delta: dict = field(default_factory=dict)
 
 
 # ============================================================
@@ -384,6 +385,8 @@ class VersionedStoryBible(StoryBible):
     MAX_CONTEXT_CHARS = 8000     # 上下文最大字符数
     DEFAULT_RECENT_SUMMARIES = 3  # 默认获取最近几章摘要
     DEFAULT_MAX_CHARACTERS = 8   # 默认最大展示角色数
+    SUMMARY_BUCKET_SIZE = 10     # 历史摘要分桶粒度（每 N 章聚为一行）
+    MAX_HISTORY_BUCKETS = 5      # 历史分桶最大展示数
 
     def __init__(self, title: str = "", genre: str = "", premise: str = ""):
         super().__init__(title, genre, premise)
@@ -493,6 +496,8 @@ class VersionedStoryBible(StoryBible):
         character_names: list[str] = None,
         max_chars: int = None,
         index=None,
+        world_state=None,
+        current_arc: str = "",
     ) -> str:
         """
         为指定章节组装写作上下文（增强版）
@@ -503,6 +508,11 @@ class VersionedStoryBible(StoryBible):
         - Token 预估
         - v0.3：传入可选 SemanticIndex 时，“待回收伏笔”“前情提要”改用语义召回，
           并输出“语义相关设定”段；无索引/未启用时行为与旧版完全一致。
+        - v0.4：连贯性强化——
+          ① 传入 WorldState 时前置“连贯性契约”段（生死/位置/物品/伏笔/弧线）
+          ② 前情提要改为“分桶滑动”：最近 N 章全量 + 更早按每 10 章聚合一行
+          ③ 启用向量索引时前情提要做全史语义召回（不只最近几章）
+          ④ 传入 current_arc 时注入当前卷剧情弧线
 
         Args:
             chapter_num: 当前章节号
@@ -510,6 +520,8 @@ class VersionedStoryBible(StoryBible):
             character_names: 指定的角色名列表
             max_chars: 最大字符限制（None 使用默认值）
             index: 可选的 SemanticIndex（禁用或为 None 时走原有逻辑）
+            world_state: 可选的世界状态账本（WorldState），渲染为连贯性契约
+            current_arc: 当前卷/弧线描述（大纲卷的 arc_summary 等）
 
         Returns:
             组装好的上下文字符串
@@ -519,6 +531,17 @@ class VersionedStoryBible(StoryBible):
         ch_key = f"ch{chapter_num}"
         use_vector = index is not None and getattr(index, "enabled", False)
         search_query = (chapter_outline or "")[:400]
+
+        # === 0. 连贯性契约（最高优先级：世界状态/伏笔/弧线/设定字典）===
+        if world_state is not None:
+            from core.world_state import build_continuity_contract
+            contract = build_continuity_contract(
+                world_state,
+                unresolved_fs=self.get_foreshadowings_planted_before(ch_key),
+                current_arc=current_arc,
+            )
+            if contract.strip():
+                parts.append(contract)
 
         # === 1. 基本信息 ===
         parts.append("=== 故事设定 ===")
@@ -562,17 +585,24 @@ class VersionedStoryBible(StoryBible):
                 parts.append("\n=== 语义相关设定 ===")
                 parts.extend(shown_related)
 
-        # === 4. 最近章节摘要 ===
+        # === 4. 前情提要（分桶滑动 + 全史语义召回）===
         recent = self.get_recent_summaries(self.DEFAULT_RECENT_SUMMARIES)
         if recent:
             parts.append("\n=== 前情提要 ===")
             shown_sums = recent
             if use_vector:
-                shown_sums = self._pick_summaries(recent, index, search_query, 3)
-                if not shown_sums:
-                    shown_sums = recent[:3]
+                shown_sums = self._pick_summaries_full(
+                    index, search_query, self.DEFAULT_RECENT_SUMMARIES,
+                    exclude_nums=[s.chapter_num for s in recent],
+                ) or recent[:3]
             for s in shown_sums:
                 parts.append(f"第{s.chapter_num}章 {s.title}: {s.summary}")
+
+        # === 4.5 历史分桶（更早章节按每 N 章聚合为一行滚动摘要）===
+        history_lines = self._build_history_buckets(recent)
+        if history_lines:
+            parts.append("\n=== 历史脉络 ===")
+            parts.extend(history_lines)
 
         # === 5. 时间线（最近事件）===
         if self.timeline:
@@ -596,6 +626,74 @@ class VersionedStoryBible(StoryBible):
             full_context = self._compress_context(full_context, max_chars, chapter_num)
 
         return full_context
+
+    def _build_history_buckets(self, recent: list) -> list:
+        """把最近窗口之外的历史摘要按每 SUMMARY_BUCKET_SIZE 章聚合为一行。
+
+        用于缓解“早期章节滚出滑窗导致长线遗忘”：只对近期的做全量展示，
+        更早的压缩成每 N 章一行的滚动摘要（最多 MAX_HISTORY_BUCKETS 行）。
+        """
+        if not self.chapter_summaries:
+            return []
+        recent_nums = {s.chapter_num for s in recent}
+        older = sorted(
+            (n for n in self.chapter_summaries if n not in recent_nums)
+        )
+        if not older:
+            return []
+
+        bucket_size = self.SUMMARY_BUCKET_SIZE
+        # 从最早的章开始分桶；每桶取【首章号-末章号】内的摘要做摘要串
+        buckets: list[tuple[int, int, list[str]]] = []
+        current_start = None
+        current_end = None
+        current_sums: list[str] = []
+        for n in older:
+            if current_start is None:
+                current_start = n
+            current_end = n
+            s = self.chapter_summaries[n]
+            current_sums.append(f"{s.summary}")
+            if n % bucket_size == 0 or n == older[-1]:
+                buckets.append((current_start, current_end, current_sums))
+                current_start = None
+                current_sums = []
+
+        lines = []
+        for start, end, sums in buckets[-self.MAX_HISTORY_BUCKETS:]:
+            joined = "；".join(x for x in sums if x)
+            if len(joined) > 180:
+                joined = joined[:177] + "..."
+            lines.append(f"第{start}-{end}章：{joined}")
+        return lines
+
+    def _pick_summaries_full(self, index, query: str, top_k: int,
+                             exclude_nums: list[int] = None) -> list:
+        """全史语义召回：从全部章节摘要（含远古章节）按相关度挑 top_k 条。
+
+        与 _pick_summaries（只在最近摘要内挑）不同，这里把索引里的 sum:* 全部
+        纳入候选，用于跨卷/跨长线记忆召回；无命中时返回空列表由调用方降级。
+        """
+        exclude = set(exclude_nums or [])
+        hits = index.search(query, top_k=max(top_k * 3, 9), prefix="sum:")
+        picked: list = []
+        for h in hits:
+            doc_id = h.get("doc_id", "")
+            if not doc_id.startswith("sum:"):
+                continue
+            num = doc_id.split(":", 1)[1]
+            try:
+                n = int(num)
+            except (TypeError, ValueError):
+                continue
+            if n in exclude:
+                continue
+            s = self.chapter_summaries.get(n)
+            if s and s not in picked:
+                picked.append(s)
+            if len(picked) >= top_k:
+                break
+        return picked
 
     # ============================================================
     # 语义召回辅助（仅在 index.enabled 时被调用，否则上层走原逻辑）
@@ -672,11 +770,13 @@ class VersionedStoryBible(StoryBible):
 
         # 按优先级裁剪
         priority_order = [
+            "连贯性契约",
             "故事设定",
             "角色信息",
             "待回收伏笔",
             "语义相关设定",
             "前情提要",
+            "历史脉络",
             "近期时间线",
             "世界观补充",
             "文风要求",

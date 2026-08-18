@@ -158,6 +158,14 @@
                             <span class="label">Story Bible 版本：</span>
                             <span id="bible-version" class="value">v0</span>
                         </div>
+                        <div class="status-item" id="world-state-item" style="display:none;">
+                            <span class="label">世界状态（截至第 <span id="ws-as-of">-</span> 章）：</span>
+                            <span id="ws-counts" class="value">-</span>
+                        </div>
+                        <div class="status-item" id="audit-item" style="display:none;">
+                            <span class="label">连贯审计：</span>
+                            <span id="audit-summary" class="value">-</span>
+                        </div>
                     </div>
                     <div class="progress-bar-container" id="progress-container" style="display:none;">
                         <div class="progress-bar" id="progress-bar"></div>
@@ -193,6 +201,7 @@
                             <span id="chapter-meta"></span>
                             <button class="toggle-btn" onclick="runReview($('#chapter-select').value)">审查本章</button>
                             <button class="toggle-btn" onclick="runPrecheck($('#chapter-select').value)">预检本章</button>
+                            <button class="toggle-btn" onclick="runAudit()">🛡️ 连贯审计</button>
                         </div>
                         <div class="chapter-view-toggle">
                             <button class="toggle-btn active" onclick="toggleChapterView('draft')">初稿</button>
@@ -200,6 +209,7 @@
                             <button class="toggle-btn" onclick="toggleChapterView('check')">检查报告</button>
                             <button class="toggle-btn" onclick="toggleChapterView('review')">审查报告</button>
                             <button class="toggle-btn" onclick="toggleChapterView('precheck')">预检报告</button>
+                            <button class="toggle-btn" onclick="toggleChapterView('audit')">审计报告</button>
                         </div>
                         <pre id="chapter-output"></pre>
                     </div>

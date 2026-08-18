@@ -45,6 +45,10 @@ class ChapterSummarySchema(BaseModel):
     resolved_foreshadowing: List[str] = Field(
         default_factory=list, description="本章回收的既有伏笔"
     )
+    world_state_delta: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="本章世界状态增量：characters/items/locations/open_threads",
+    )
 
     @field_validator("summary")
     @classmethod
@@ -112,6 +116,12 @@ class ChapterSummarizerAgent(BaseAgent):
    - new_foreshadowing 记录本章新埋设的伏笔（一句话一条）
    - resolved_foreshadowing 记录本章回收的既有伏笔（注明对应前文的伏笔）
    - 没有就留空数组，不要臆造
+6. **世界状态增量**：world_state_delta 记录本章结束后的世界级状态变化，用于后续章节保持连贯：
+   - characters：出场角色的生死(alive)/位置(location)/实力(power_level)变化，键为角色名，值为对象
+   - items：物品易主/转移/损毁（owner/location/status），键为物品名
+   - locations：地点状态变化（current_state），键为地点名
+   - open_threads：本章新开启且未闭合的剧情线（一句话一条）
+   - 无变化则留空对象，不要臆造
 
 ## 输出要求
 请严格以 JSON 格式输出，字段如下：
@@ -124,7 +134,13 @@ class ChapterSummarizerAgent(BaseAgent):
   "key_events": ["关键事件1", "关键事件2"],
   "character_state_changes": {"角色名": "状态变化描述"},
   "new_foreshadowing": ["新埋设伏笔"],
-  "resolved_foreshadowing": ["回收的伏笔"]
+  "resolved_foreshadowing": ["回收的伏笔"],
+  "world_state_delta": {
+    "characters": {"角色名": {"alive": true, "location": "地点", "power_level": "实力描述"}},
+    "items": {"物品名": {"owner": "持有者", "location": "位置", "status": "状态"}},
+    "locations": {"地点名": {"current_state": "当前状态"}},
+    "open_threads": ["未闭合剧情线1"]
+  }
 }
 ```
 
@@ -165,6 +181,28 @@ class ChapterSummarizerAgent(BaseAgent):
         if isinstance(v, dict):
             return {str(k): cls._to_str(val) for k, val in v.items()}
         return {}
+
+    @staticmethod
+    def _to_delta_dict(v: Any) -> Dict[str, Any]:
+        """任意值强转为世界状态增量字典（仅保留四类合法子键）。"""
+        if not isinstance(v, dict):
+            return {}
+        allowed = {"characters", "items", "locations", "open_threads"}
+        out: Dict[str, Any] = {}
+        for key in allowed:
+            sub = v.get(key)
+            if not sub:
+                continue
+            if key == "open_threads":
+                if isinstance(sub, list):
+                    out[key] = [str(x) for x in sub if str(x).strip()]
+                continue
+            if isinstance(sub, dict):
+                out[key] = {
+                    str(k): (dict(val) if isinstance(val, dict) else {})
+                    for k, val in sub.items() if isinstance(val, dict)
+                }
+        return out
 
     # ------------------------------------------------------------------ #
     # 内部工具方法
@@ -263,6 +301,7 @@ class ChapterSummarizerAgent(BaseAgent):
                 "character_state_changes": self._to_dict(raw.get("character_state_changes")),
                 "new_foreshadowing": self._to_list(raw.get("new_foreshadowing")),
                 "resolved_foreshadowing": self._to_list(raw.get("resolved_foreshadowing")),
+                "world_state_delta": self._to_delta_dict(raw.get("world_state_delta")),
             }
             schema = ChapterSummarySchema(**safe)
 
@@ -363,6 +402,16 @@ class ChapterSummarizerAgent(BaseAgent):
             for k, v in cls._to_dict(p.get("character_state_changes")).items():
                 state_changes[k] = v
 
+        ws_delta: Dict[str, Any] = {}
+        for p in partials:
+            d = cls._to_delta_dict(p.get("world_state_delta"))
+            for key in ("characters", "items", "locations"):
+                for k, v in (d.get(key) or {}).items():
+                    ws_delta.setdefault(key, {})[k] = v
+            ws_delta["open_threads"] = _dedup(
+                (ws_delta.get("open_threads") or []) + (d.get("open_threads") or [])
+            )
+
         merged: Dict[str, Any] = {
             "chapter_num": next(
                 (p["chapter_num"] for p in partials if p.get("chapter_num")), 0
@@ -384,6 +433,7 @@ class ChapterSummarizerAgent(BaseAgent):
             "resolved_foreshadowing": _dedup(
                 sum((cls._to_list(p.get("resolved_foreshadowing")) for p in partials), [])
             ),
+            "world_state_delta": ws_delta,
         }
         # 合并结果不保留解析/兜底标记字段
         return {k: v for k, v in merged.items()}

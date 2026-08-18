@@ -55,10 +55,12 @@ from agents import (
     ChapterSummarizerAgent,
     ReviewerAgent,
     ShortStoryAgent,
+    AuditAgent,
 )
 from agents.base import tracker as token_tracker
 from agents.checker_agent import QUALITY_FLOOR
 from agents.outline_agent import MAX_CHAPTERS_PER_CALL
+from core.world_state import WorldState, build_continuity_contract
 
 app = Flask(
     __name__,
@@ -89,6 +91,7 @@ class NovelProject:
     """小说项目状态（v0.2 增强 + 线程安全）"""
 
     MAX_RETRIES = 3  # Checker 失败后的最大重写次数
+    AUDIT_INTERVAL = 5  # 每写满 N 章自动触发一次全量连贯性审计
 
     def __init__(self):
         self.reset()
@@ -102,8 +105,9 @@ class NovelProject:
         self.bible: VersionedStoryBible = VersionedStoryBible()
         self.outline = {}
         self.chapters = {}  # {chapter_num: {"draft": str, "polished": str, "check_report": dict, "retry_count": int}}
-        self.vector_index = SemanticIndex()  # 可选语义索引（默认禁用/降级）
+        self.vector_index = SemanticIndex()  # 可选语义索引（默认开启/无依赖降级）
         self.state_tracker = StoryStateTracker(index=self.vector_index)  # 跨章状态（角色/伏笔/前情/历史问题）
+        self.world_state = WorldState()  # 世界状态账本（长篇连贯性权威记忆）
         self.current_step = PipelineStep.INPUT
         self.status_message = "准备就绪"
         self.is_running = False
@@ -127,6 +131,9 @@ class NovelProject:
             "review_report": {},
             "precheck": {},
         }
+        # 全量连贯性审计（最近一次结果 + 已审计到的章节号）
+        self.audit_report = {}
+        self.last_audited_chapter = 0
 
     # ============================================================
     # v0.2 修复 #4：数据持久化与恢复
@@ -172,6 +179,10 @@ class NovelProject:
                 # 保存短篇小说模式状态
                 with open(os.path.join(self.DATA_DIR, "short_story.json"), "w", encoding="utf-8") as f:
                     json.dump(self.short_story, f, ensure_ascii=False, indent=2)
+
+                # 保存世界状态账本（长篇连贯性）
+                with open(os.path.join(self.DATA_DIR, "world_state.json"), "w", encoding="utf-8") as f:
+                    json.dump(self.world_state.to_dict(), f, ensure_ascii=False, indent=2)
 
             except Exception as e:
                 print(f"[警告] 保存状态失败: {e}")
@@ -232,6 +243,12 @@ class NovelProject:
                 if os.path.exists(short_path):
                     with open(short_path, "r", encoding="utf-8") as f:
                         self.short_story = json.load(f)
+
+                # 恢复世界状态账本
+                ws_path = os.path.join(self.DATA_DIR, "world_state.json")
+                if os.path.exists(ws_path):
+                    with open(ws_path, "r", encoding="utf-8") as f:
+                        self.world_state = WorldState.from_dict(json.load(f))
 
                 # 从恢复的故事圣经重建语义索引（幂等）
                 self.sync_vector_index()
@@ -390,11 +407,13 @@ def _execute_write_chapter_with_retry(chapter_num: int = None, **kwargs):
     # 获取本章细纲
     chapter_outline = _get_chapter_outline(chapter_num)
 
-    # 构建上下文（使用增强版的压缩功能）
+    # 构建上下文（使用增强版的压缩功能；注入世界状态契约 + 当前弧线）
     context = project.bible.build_context_for_chapter(
         chapter_num=chapter_num,
         chapter_outline=json.dumps(chapter_outline, ensure_ascii=False),
         index=project.vector_index,
+        world_state=project.world_state,
+        current_arc=_get_current_arc(chapter_num),
     )
 
     writer = WriterAgent(temperature=0.85)
@@ -516,6 +535,11 @@ def _execute_write_chapter_with_retry(chapter_num: int = None, **kwargs):
     if check_result:
         _writeback_state(chapter_num, check_result)
 
+    # 周期性全量连贯性审计（每 AUDIT_INTERVAL 章一次，仅记录不阻塞）
+    if chapter_num % project.AUDIT_INTERVAL == 0:
+        _log(f"🛡️ 达到第 {chapter_num} 章，触发全量连贯性审计...")
+        _run_continuity_audit()
+
     # 创建版本快照
     with project._lock:
         project.bible.checkpoint(f"第{chapter_num}章完成")
@@ -593,6 +617,27 @@ def _get_chapter_outline(chapter_num: int) -> dict:
                 return ch
 
     return _append_placeholder_outline(chapter_num, volumes)
+
+
+def _get_current_arc(chapter_num: int) -> str:
+    """根据章号定位当前所处卷，返回该卷的剧情弧线描述（arc_summary / climax）。"""
+    try:
+        volumes = project.outline.get("volumes", [])
+        for vol in volumes:
+            chapters = vol.get("chapters", [])
+            if not chapters:
+                continue
+            nums = [c.get("num", 0) for c in chapters]
+            if nums and min(nums) <= chapter_num <= max(nums):
+                bits = [f"《{vol.get('volume_title', '')}》"]
+                if vol.get("arc_summary"):
+                    bits.append(vol["arc_summary"])
+                if vol.get("climax"):
+                    bits.append(f"本卷高潮：{vol['climax']}")
+                return "；".join(bits)
+        return ""
+    except Exception:
+        return ""
 
 
 def _append_placeholder_outline(chapter_num: int, volumes: list) -> dict:
@@ -719,6 +764,61 @@ def _run_chapter_precheck(chapter_num: int, text: str) -> dict:
         return result
     except Exception as e:
         _log(f"⚠️ 第 {chapter_num} 章预检失败：{e}")
+        return {}
+
+
+# ============================================================
+# 全量连贯性审计（v0.4：长篇小说前后一致性兜底）
+# ============================================================
+
+def _run_continuity_audit() -> dict:
+    """对全书已写章节做一次全量一致性审计，结果存 project.audit_report。
+
+    只记录不阻塞：审计发现的整改清单供用户手动挑选、重写对应章节。
+    """
+    with project._lock:
+        chapters = dict(project.chapters)
+        as_of = max(chapters.keys(), default=0)
+        if not as_of:
+            return {}
+        world_text = project.world_state.to_text(char_limit=600)
+        bible_text = _build_bible_summary_for_check()
+        issue_text = "\n".join(
+            f"- 第{h.get('chapter', '?')}章：{'、'.join(h.get('issue_types', []) or [])}"
+            for h in project.state_tracker.issue_history[-8:]
+        )
+
+    try:
+        # 章节正文抽样拼接（每章取首尾各 400 字，控制单次审计输入规模）
+        sampled = []
+        for num in sorted(chapters):
+            body = (chapters[num].get("polished") or chapters[num].get("draft") or "")
+            if not body:
+                continue
+            head = body[:400]
+            tail = body[-400:] if len(body) > 800 else ""
+            sampled.append(f"===== 第{num}章 =====\n{head}\n{'…（中段略）…' + tail if tail else ''}")
+
+        auditor = AuditAgent(temperature=0.2)
+        report = auditor.run(
+            chapters_text="\n\n".join(sampled),
+            world_state_text=world_text,
+            bible_summary=bible_text,
+            issue_history_text=issue_text,
+            as_of_chapter=as_of,
+        )
+        report["audited_chapters"] = len(chapters)
+        with project._lock:
+            project.audit_report = report
+            project.last_audited_chapter = as_of
+            project.save_state()
+        n = len(report.get("findings", []))
+        _log(f"🛡️ 全量连贯性审计完成（截至第 {as_of} 章）：{n} 条发现"
+             f"（S1:{sum(1 for f in report.get('findings', []) if f.get('severity') == 'S1')} / "
+             f"S2:{sum(1 for f in report.get('findings', []) if f.get('severity') == 'S2')}）")
+        return report
+    except Exception as e:
+        _log(f"⚠️ 全量连贯性审计失败：{e}")
         return {}
 
 
@@ -876,6 +976,14 @@ def _seed_tracker_characters() -> None:
         for c in project.bible.characters.values():
             project.state_tracker.upsert_character(c.name, alive=c.status != "dead")
 
+        # 世界状态账本首次播种：以 Bible 角色卡的生死/状态为初始快照
+        if not project.world_state.characters:
+            for c in project.bible.characters.values():
+                entry = {"alive": c.status != "dead"}
+                if c.status and c.status != "alive":
+                    entry["status"] = c.status
+                project.world_state.characters[c.name] = entry
+
 
 def _build_revision_notes(check_result: dict, chapter_num: int) -> str:
     """把检查结果汇总为重写反馈；评分过低但无具体 issue 时给出整体提示。"""
@@ -963,6 +1071,28 @@ def _extract_and_update_summary(chapter_num: int, text: str):
 
     # 章节摘要同步进语义索引（供前情提要语义召回）
     project.sync_vector_index()
+
+    # 更新世界状态账本（吸收摘要产出的世界状态增量 + 刷新伏笔台账）
+    _update_world_state(chapter_num, summary)
+
+
+def _update_world_state(chapter_num: int, summary: ChapterSummary) -> None:
+    """把本章摘要的世界状态增量合并进账本，并刷新未回收伏笔台账。"""
+    with project._lock:
+        project.world_state.apply_delta(chapter_num, getattr(summary, "world_state_delta", None) or {})
+
+        # 刷新伏笔台账（与 Bible 未回收伏笔一致，并计算搁置时长）
+        unresolved = project.bible.get_unresolved_foreshadowings()
+        project.world_state.set_foreshadowings(
+            [
+                {"content": fs.content, "planted_in": fs.planted_in, "hint": fs.hint}
+                for fs in unresolved
+            ],
+            as_of_chapter=chapter_num,
+        )
+        # 追踪器同步已知章节号（供 Checker 伏笔搁置提示）
+        project.state_tracker.mark_chapter(chapter_num)
+        project.save_state()
 
 
 def _log(message: str):
@@ -1084,6 +1214,33 @@ def api_precheck_chapter(chapter_num):
     result = _run_chapter_precheck(chapter_num, text)
     project.save_state()
     return jsonify({"chapter": chapter_num, "precheck": result})
+
+
+@app.route("/api/audit", methods=["POST", "GET"])
+def api_audit():
+    """对全书已写章节做全量连贯性审计（v0.4），同步返回整改清单。
+
+    POST 触发审计；GET 仅返回最近一次审计报告。
+    """
+    if request.method == "GET":
+        with project._lock:
+            report = project.audit_report or {}
+            return jsonify({
+                "audit_report": report,
+                "last_audited_chapter": project.last_audited_chapter,
+            })
+
+    if project.is_running:
+        return jsonify({"error": "正在运行中，请等待"}), 400
+
+    with project._lock:
+        if not project.chapters:
+            return jsonify({"error": "暂无已写章节，请先写作"}), 400
+
+    report = _run_continuity_audit()
+    if not report:
+        return jsonify({"error": "审计未执行（发生异常）"}), 400
+    return jsonify({"audit_report": report})
 
 
 # ============================================================
@@ -1286,6 +1443,8 @@ def api_stream_write(chapter_num):
                 chapter_num=chapter_num,
                 chapter_outline=json_mod.dumps(chapter_outline, ensure_ascii=False),
                 index=project.vector_index,
+                world_state=project.world_state,
+                current_arc=_get_current_arc(chapter_num),
             )
 
             writer = WriterAgent(temperature=0.85)
@@ -1534,6 +1693,8 @@ def api_stream_all():
                     chapter_num=ch,
                     chapter_outline=json_mod.dumps(chapter_outline, ensure_ascii=False),
                     index=project.vector_index,
+                    world_state=project.world_state,
+                    current_arc=_get_current_arc(ch),
                 )
 
                 writer = WriterAgent(temperature=0.85)
@@ -1710,6 +1871,21 @@ def api_status():
                 "precheck_enabled": project.precheck_enabled,
                 "skills_dir_available": is_available("story-review"),
                 "skills_dir": str(resolve_skills_dir()),
+            },
+            # v0.4 世界状态账本 + 全量连贯性审计
+            "world_state": {
+                "as_of_chapter": project.world_state.as_of_chapter,
+                "character_count": len(project.world_state.characters),
+                "open_foreshadowings": len(project.world_state.pending_foreshadowings),
+                "open_threads": len(project.world_state.open_threads),
+                "text": project.world_state.to_text(char_limit=400),
+            },
+            "audit": {
+                "last_audited_chapter": project.last_audited_chapter,
+                "findings_count": len(project.audit_report.get("findings", [])) if project.audit_report else 0,
+                "s1_count": sum(1 for f in (project.audit_report.get("findings") or []) if f.get("severity") == "S1"),
+                "s2_count": sum(1 for f in (project.audit_report.get("findings") or []) if f.get("severity") == "S2"),
+                "summary": (project.audit_report or {}).get("summary", ""),
             },
         })
 

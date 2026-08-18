@@ -6,7 +6,8 @@
   或模型加载失败时，SemanticIndex 处于禁用态，所有方法立刻返回降级结果，
   上层（StoryBible / StoryStateTracker）自动回退到原有子串匹配 + 滑窗摘要，
   行为与未接入前完全一致（Demo 模式不受影响）。
-- 模型默认使用中文小模型 BAAI/bge-small-zh-v1.5，首次使用需联网下载。
+- 模型默认使用中文小模型 BAAI/bge-small-zh-v1.5；下载源优先魔搭社区（ModelScope），
+  失败自动回退 Hugging Face。可用 `MODEL_SOURCE=huggingface` 强制走 Hugging Face。
 """
 
 from __future__ import annotations
@@ -17,9 +18,11 @@ import os
 import threading
 from typing import Optional
 
-ENABLE_VECTOR = os.environ.get("ENABLE_VECTOR", "off").strip().lower() in (
+ENABLE_VECTOR = os.environ.get("ENABLE_VECTOR", "on").strip().lower() in (
     "1", "true", "on", "yes",
 )
+# 模型下载源：默认优先从魔搭社区（ModelScope）拉取，失败自动回退 Hugging Face
+MODEL_SOURCE = os.environ.get("MODEL_SOURCE", "modelscope").strip().lower()
 
 
 class SemanticIndex:
@@ -63,9 +66,10 @@ class SemanticIndex:
         try:
             from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self.MODEL_NAME)
+            model_path = self._resolve_model_path()
+            self._model = SentenceTransformer(model_path)
         except Exception as e:
-            self._load_error = f"加载模型失败: {e}（请安装 sentence-transformers 或检查网络）"
+            self._load_error = f"加载模型失败: {e}（请安装 sentence-transformers/modelscope 或检查网络）"
             self._model = None
             print(f"[SemanticIndex] {self._load_error}")
             return
@@ -75,6 +79,26 @@ class SemanticIndex:
         except Exception as e:
             self._load_error = f"加载向量数据失败: {e}"
             print(f"[SemanticIndex] {self._load_error}")
+
+    def _resolve_model_path(self) -> str:
+        """解析模型来源路径。
+
+        默认（MODEL_SOURCE=modelscope）从魔搭社区下载模型到本地缓存目录，
+        再交给 SentenceTransformer 加载本地路径；modelscope 未安装或下载失败时
+        回退为直连 Hugging Face（使用模型名）。显式设为 huggingface 则跳过魔搭。
+        """
+        if MODEL_SOURCE == "huggingface":
+            return self.MODEL_NAME
+        try:
+            from modelscope import snapshot_download
+
+            local_dir = snapshot_download(self.MODEL_NAME)
+            if local_dir:
+                print(f"[SemanticIndex] 已从魔搭社区下载模型: {self.MODEL_NAME} → {local_dir}")
+                return local_dir
+        except Exception as e:
+            print(f"[SemanticIndex] 魔搭下载失败，回退 Hugging Face: {e}")
+        return self.MODEL_NAME
 
     def _load_persisted(self):
         with self._lock:

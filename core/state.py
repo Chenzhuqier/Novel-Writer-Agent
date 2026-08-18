@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from typing import Any, Optional
 
@@ -12,13 +13,14 @@ from typing import Any, Optional
 class StoryStateTracker:
     """角色状态与伏笔台账由生成流程（或人工）维护，本类负责装配与回写。"""
 
-    def __init__(self, digest_window: int = 3, index=None):
+    def __init__(self, digest_window: int = 3, index=None, as_of_chapter: int = 0):
         self.character_states: list[dict] = []
         self.open_foreshadowing: list[str] = []
         self._digests: deque[str] = deque(maxlen=digest_window)
         self.issue_history: list[dict] = []
         # 可选语义索引：接入后伏笔匹配走向量相似度，否则回退子串
         self.index = index
+        self.as_of_chapter = int(as_of_chapter or 0)  # 供伏笔搁置时长计算
 
     # ---------------- 角色状态维护（由生成 Agent / 人工调用） ----------------
 
@@ -40,10 +42,33 @@ class StoryStateTracker:
         """生成 checker.run() 的关键字参数。"""
         return {
             "character_states": self.character_states or None,
-            "open_foreshadowing": self.open_foreshadowing or None,
+            "open_foreshadowing": self._aged_foreshadowings() or None,
             "prev_chapter_digest": "\n".join(self._digests),
             "issue_history": list(self.issue_history),
         }
+
+    def _aged_foreshadowings(self) -> list[str]:
+        """给未回收伏笔标注埋设章与搁置时长（埋设超过 5 章未回收给 warning 提示）。"""
+        out = []
+        for f in self.open_foreshadowing:
+            line = str(f)
+            m = re.search(r"第\s*(\d+)\s*章", line)
+            if m:
+                planted = int(m.group(1))
+                age = self.as_of_chapter - planted
+                if 5 <= age <= 8:
+                    out.append(f"{line}（已埋设{age}章，建议近期推进）")
+                elif age > 8:
+                    out.append(f"{line}（已埋设{age}章未回收，建议安排回收）")
+                else:
+                    out.append(line)
+            else:
+                out.append(line)
+        return out
+
+    def mark_chapter(self, chapter_num: int) -> None:
+        """更新账本已知章节号（供伏笔搁置时长计算）。"""
+        self.as_of_chapter = max(self.as_of_chapter, int(chapter_num or 0))
 
     def ingest_report(self, chapter_num: int, report: dict,
                       chapter_digest: str = "", index=None) -> None:
@@ -96,11 +121,13 @@ class StoryStateTracker:
             "open_foreshadowing": self.open_foreshadowing,
             "digests": list(self._digests),
             "issue_history": self.issue_history,
+            "as_of_chapter": self.as_of_chapter,
         }
 
     @classmethod
     def from_dict(cls, data: dict, digest_window: int = 3) -> "StoryStateTracker":
-        tracker = cls(digest_window=digest_window)
+        tracker = cls(digest_window=digest_window,
+                      as_of_chapter=data.get("as_of_chapter", 0))
         tracker.character_states = list(data.get("character_states", []))
         tracker.open_foreshadowing = list(data.get("open_foreshadowing", []))
         for d in data.get("digests", []):

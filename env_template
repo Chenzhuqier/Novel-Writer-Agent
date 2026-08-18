@@ -34,6 +34,9 @@ OPENAI_API_KEY=sk-your-key-here
 # ENABLE_VECTOR=off
 # VECTOR_MODEL=BAAI/bge-small-zh-v1.5
 #
+# 模型下载源（默认魔搭社区 ModelScope；失败自动回退 Hugging Face）：
+# MODEL_SOURCE=modelscope        # 或 huggingface 强制走 Hugging Face
+#
 # 安装方式（首次会联网下载模型，约 100MB）：
 #   pip install -r requirements-rag.txt
 

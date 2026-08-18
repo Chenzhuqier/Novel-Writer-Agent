@@ -32,6 +32,8 @@ const AppState = {
   statusMessage: '',
   nextChapter: 1,
   chapterView: 'draft',
+  audit: null,
+  worldState: null,
 };
 
 const STEP_LABELS = {
@@ -180,6 +182,10 @@ function loadChapter(num) {
         content = ch.precheck
           ? formatPrecheckReport(ch.precheck)
           : '(暂无预检报告，可点击「预检本章」触发)';
+      } else if (view === 'audit') {
+        $('#chapter-output').innerHTML = '';
+        loadAuditReport();
+        return;
       } else {
         content = ch.draft || '(暂无初稿)';
       }
@@ -290,6 +296,77 @@ function toggleChapterView(view) {
   });
   const sel = $('#chapter-select');
   if (sel && sel.value) loadChapter(sel.value);
+}
+
+function runAudit() {
+  addLog('🛡️ 开始全量连贯性审计...');
+  fetch('/api/audit', { method: 'POST' })
+    .then((r) => r.json())
+    .then((data) => {
+      if (data.error) throw new Error(data.error);
+      const report = data.audit_report;
+      addLog(`✅ 全量连贯性审计完成：${report.findings.length} 条发现`, 'success');
+      AppState.audit = AppState.audit || {};
+      AppState.audit._report = report;
+      AppState.audit.last_audited_chapter = report.audited_chapters || 0;
+      AppState.audit.findings_count = report.findings.length;
+      AppState.chapterView = 'audit';
+      renderAuditReport();
+    })
+    .catch((err) => addLog(`❌ 审计失败：${err.message}`, 'error'));
+}
+
+function loadAuditReport() {
+  fetch('/api/audit')
+    .then((r) => r.json())
+    .then((data) => {
+      const report = data.audit_report || {};
+      AppState.audit = AppState.audit || {};
+      AppState.audit._report = report;
+      AppState.audit.last_audited_chapter = data.last_audited_chapter || report.audited_chapters || 0;
+      AppState.audit.findings_count = (report.findings || []).length;
+      renderAuditReport();
+    })
+    .catch(() => renderAuditReport());
+}
+
+function renderAuditReport() {
+  const out = $('#chapter-output');
+  if (!out) return;
+  if (!AppState.audit || !AppState.audit.last_audited_chapter) {
+    out.innerHTML = '<div class="report-block">(尚未执行过全量连贯性审计，可点击「连贯审计」触发)</div>';
+    return;
+  }
+  const { audit } = AppState;
+  out.innerHTML = formatAuditReport(audit);
+  const meta = $('#chapter-meta');
+  if (meta) meta.textContent =
+    `全量审计 · 截至第 ${audit.last_audited_chapter} 章 · ${audit.findings_count} 条发现`;
+}
+
+function formatAuditReport(audit) {
+  const report = audit._report || {};
+  const findings = (report.findings || [])
+    .map(
+      (f) =>
+        `<li><b>[${f.severity}]</b> 第${esc(f.chapter)}章 · ${esc(f.issue)}` +
+        (f.evidence ? `<br><span class="report-ev">证据：${esc(f.evidence)}</span>` : '') +
+        (f.suggestion ? `<br><span class="report-fix">建议：${esc(f.suggestion)}</span>` : '') +
+        `</li>`
+    )
+    .join('');
+  const recs = report.recommendations || [];
+  return (
+    `<div class="report-block">` +
+    `<h4>🛡️ 全量连贯性审计报告` +
+    (report.audited_chapters ? ` · 覆盖 ${report.audited_chapters} 章` : '') +
+    ` · ${(report.findings || []).length} 条发现</h4>` +
+    `<div class="report-meta">截至第 ${esc(audit.last_audited_chapter || '?')} 章</div>` +
+    (report.summary ? `<p>${esc(report.summary)}</p>` : '') +
+    (findings ? `<ul>${findings}</ul>` : `<p class="report-ok">✓ 未发现明显连贯性问题</p>`) +
+    (recs.length ? `<p class="report-fix"><b>整改建议：</b>${esc(recs.join('；'))}</p>` : '') +
+    `</div>`
+  );
 }
 
 // ============================================================
@@ -450,6 +527,30 @@ function updateUI() {
   setHTML('progress', `${AppState.writtenChapters.length}/${AppState.totalChapters || 0}`);
   setHTML('bible-version', `v${AppState.bibleVersion}`);
   toggleShow('#progress-container', running);
+
+  // 世界状态账本摘要 + 连贯审计摘要
+  const ws = AppState.worldState;
+  if (ws && ws.as_of_chapter) {
+    setHTML('ws-as-of', ws.as_of_chapter);
+    setHTML('ws-counts',
+      `${ws.character_count} 角色 · ${ws.open_foreshadowings} 未回收伏笔 · ${ws.open_threads} 剧情线`);
+    toggleShow('#world-state-item', true);
+  } else {
+    toggleShow('#world-state-item', false);
+  }
+  const audit = AppState.audit;
+  if (audit && audit.last_audited_chapter) {
+    const parts = [];
+    if (audit.s1_count) parts.push(`S1×${audit.s1_count}`);
+    if (audit.s2_count) parts.push(`S2×${audit.s2_count}`);
+    setHTML('audit-summary',
+      `截至第 ${audit.last_audited_chapter} 章 · ${audit.findings_count} 条` +
+      (parts.length ? `（${parts.join(' / ')}）` : '') +
+      (audit.summary ? ` · ${audit.summary}` : ''));
+    toggleShow('#audit-item', true);
+  } else {
+    toggleShow('#audit-item', false);
+  }
 
   // 按钮状态（满足「打开页面即可继续生成」）
   const hasWorld = AppState.characterCount > 0;
@@ -650,6 +751,8 @@ function applyStatus(status, echo = true) {
   AppState.foreshadowingCount = status.foreshadowing_count || 0;
   AppState.bibleVersion = status.bible_version != null ? status.bible_version : AppState.bibleVersion;
   AppState.nextChapter = status.next_chapter || (AppState.writtenChapters.length + 1);
+  AppState.audit = status.audit || AppState.audit;
+  AppState.worldState = status.world_state || AppState.worldState;
 
   if (echo) {
     if ($('#premise')) $('#premise').value = AppState.premise;
